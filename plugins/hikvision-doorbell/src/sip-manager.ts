@@ -122,7 +122,7 @@ export class SipManager {
          const doit = new Promise<boolean> (resolve => {
 
           sip.send (byeMsg, (rs) => {
-            this.console.log (`BYE response:\n${sip.stringify (rs)}`);
+            console.debug (`BYE response:\n${sip.stringify (rs)}`);
             if (rs.status == 200) {
               this.state.status = DialogStatus.HangupAc;
               resolve(true);
@@ -176,10 +176,10 @@ export class SipManager {
         await sip.start({
           logger: { 
             send: (message, addrInfo) => {  
-              this.console.log(`send to ${addrInfo.address}:\n${sip.stringify(message)}`); 
+              console.debug(`send to ${addrInfo.address}:\n${sip.stringify(message)}`); 
             },
             recv: (message, addrInfo) => {  
-              this.console.log(`recv to ${addrInfo.address}:\n${sip.stringify(message)}`); 
+              console.debug(`recv to ${addrInfo.address}:\n${sip.stringify(message)}`); 
             }
           },
           address: this.localIp,

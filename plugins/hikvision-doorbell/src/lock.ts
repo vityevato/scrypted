@@ -1,24 +1,14 @@
-import sdk, { ScryptedDeviceBase, SettingValue, ScryptedInterface, Setting, Settings, Lock, LockState, Readme } from "@scrypted/sdk";
+import { Lock, LockState, Readme, ScryptedDeviceBase, ScryptedInterface } from "@scrypted/sdk";
 import { HikvisionDoorbellAPI } from "./doorbell-api";
-import { HikvisionDoorbellProvider } from "./main";
+import type { HikvisionCameraDoorbell } from "./main";
 import * as fs from 'fs/promises';
 import { join } from 'path';
 
-const { deviceManager } = sdk;
+export class HikvisionLock extends ScryptedDeviceBase implements Lock, Readme {
 
-export class HikvisionLock extends ScryptedDeviceBase implements Lock, Settings, Readme {
-
-    // timeout: NodeJS.Timeout;
-
-    private provider: HikvisionDoorbellProvider;
-
-    constructor(nativeId: string, provider: HikvisionDoorbellProvider) {
+    constructor (public camera: HikvisionCameraDoorbell, nativeId: string, public doorNumber: string = '1') {
         super (nativeId);
-
         this.lockState = this.lockState || LockState.Unlocked;
-        this.provider = provider;
-        
-        // provider.updateLock (nativeId, this.name);
     }
 
     async getReadmeMarkdown(): Promise<string> 
@@ -27,52 +17,26 @@ export class HikvisionLock extends ScryptedDeviceBase implements Lock, Settings,
         return fs.readFile (fileName, 'utf-8');
     }
 
-    lock(): Promise<void> {
-        return this.getClient().closeDoor();
-    }
-    unlock(): Promise<void> {
-        return this.getClient().openDoor();
-    }
-
-    async getSettings(): Promise<Setting[]> {
-        const cameraNativeId = this.storage.getItem (HikvisionDoorbellProvider.CAMERA_NATIVE_ID_KEY);
-        const state = deviceManager.getDeviceState (cameraNativeId);
-        return [
-            {
-                key: 'parentDevice',
-                title: 'Linked Doorbell Device Name',
-                description: 'The name of the associated doorbell plugin device (for information)',
-                value: state.id,
-                readonly: true,
-                type: 'device',
-            },
-            {
-                key: 'ip',
-                title: 'IP Address',
-                description: 'IP address of the doorbell device (for information)',
-                value: this.storage.getItem ('ip'),
-                readonly: true,
-                type: 'string',
-            }
-        ]
-    }
-    async putSetting(key: string, value: SettingValue): Promise<void> {
-        this.storage.setItem(key, value.toString());
-    }
-
-    getClient(): HikvisionDoorbellAPI
+    async lock(): Promise<void>
     {
-        const ip = this.storage.getItem ('ip');
-        const port = this.storage.getItem ('port');
-        const user = this.storage.getItem ('user');
-        const pass = this.storage.getItem ('pass');
+        const capabilities = await this.getClient().getDoorControlCapabilities();
+        const command = capabilities.availableCommands.includes ('close') ? 'close' : 'resume';
+        await this.getClient().controlDoor (this.doorNumber, command);
+        this.lockState = LockState.Locked;
+    }
 
-        return this.provider.createSharedClient(ip, port, user, pass, this.console, this.storage);
+    async unlock(): Promise<void>
+    {
+        await this.getClient().controlDoor (this.doorNumber, 'open');
+        this.lockState = LockState.Unlocked;
+    }
+
+    private getClient(): HikvisionDoorbellAPI {
+        return this.camera.getClient();
     }
 
     static deviceInterfaces: string[] = [
         ScryptedInterface.Lock,
-        ScryptedInterface.Settings,
         ScryptedInterface.Readme
     ];
 }

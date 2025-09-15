@@ -1,5 +1,5 @@
 import { HikvisionCamera } from "../../hikvision/src/main"
-import sdk, { Camera, DeviceCreatorSettings, DeviceInformation, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, Reboot, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, LockState, Readme } from "@scrypted/sdk";
+import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, Reboot, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, LockState, Readme } from "@scrypted/sdk";
 import { PassThrough } from "stream";
 import { RtpPacket } from '../../../external/werift/packages/rtp/src/rtp/rtp';
 import { createRtspMediaStreamOptions, RtspProvider, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
@@ -13,12 +13,13 @@ import { HikvisionLock } from "./lock"
 import { HikvisionTamperAlert } from "./tamper-alert"
 import * as fs from 'fs/promises';
 import { join } from 'path';
+import { makeDebugConsole, DebugController } from "./debug-console";
 
 const { mediaManager, deviceManager } = sdk;
 
-const EXPOSE_LOCK_KEY: string = 'exposeLock';
+const PROVIDED_DEVICES_KEY: string = 'providedDevices';
+
 const USE_CONTACT_SENSOR_KEY: string = 'useContactSensor';
-const EXPOSE_ALERT_KEY: string = 'exposeAlert';
 
 const SIP_MODE_KEY: string = 'sipMode';
 const SIP_CLIENT_CALLID_KEY: string = 'sipClientCallId';
@@ -27,7 +28,15 @@ const SIP_CLIENT_PASSWORD_KEY: string = 'sipClientPassword';
 const SIP_CLIENT_PROXY_IP_KEY: string = 'sipClientProxyIp';
 const SIP_CLIENT_PROXY_PORT_KEY: string = 'sipClientProxyPort';
 const SIP_SERVER_PORT_KEY: string = 'sipServerPort';
-const SIP_SERVER_INSTALL_ON_KEY: string = 'sipServerInstallOnDevice';
+const SIP_SERVER_ROOM_NUMBER_KEY: string = 'sipServerRoomNumber';
+const SIP_SERVER_PROXY_PHONE_KEY: string = 'sipServerProxyPhone';
+const SIP_SERVER_DOORBELL_PHONE_KEY: string = 'sipServerDoorbellPhone';
+const SIP_SERVER_BUTTON_NUMBER_KEY: string = 'sipServerButtonNumber';
+
+const DEFAULT_ROOM_NUMBER: string = '5871';
+const DEFAULT_PROXY_PHONE: string = '10102';
+const DEFAULT_DOORBELL_PHONE: string = '10101';
+const DEFAULT_BUTTON_NUMBER: string = '1';
 
 const OPEN_LOCK_AUDIO_NOTIFY_DURASTION: number = 3000  // mSeconds
 const UNREACHED_REPEAT_TIMEOUT: number = 10000  // mSeconds
@@ -44,19 +53,24 @@ enum SipMode {
     Server = "Emulate SIP Proxy"
 }
 
-class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Intercom, Reboot, Readme 
-{
+export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Intercom, Reboot, Readme {
+    locks: Map<string, HikvisionLock> = new Map();
+    tamperAlert?: HikvisionTamperAlert;
     sipManager?: SipManager;
 
     private controlEvents: EventEmitter = new EventEmitter();
     private doorOpenDurationTimeout: NodeJS.Timeout;
+    private debugController: DebugController;
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
 
-        this.updateDevice();
+        this.debugController = makeDebugConsole (this.console);
+        // Set debug mode from storage
+        const debugEnabled = this.storage.getItem ('debug');
+        this.debugController.setDebugEnabled (debugEnabled === 'true');
+        
         this.updateSip();
-        this.updateDeviceInfo();
     }
 
     destroy(): void
@@ -114,7 +128,6 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
         const events = await api.listenEvents();
 
         let ignoreCameraNumber: boolean;
-        let pulseTimeout: NodeJS.Timeout;
 
         let motionPingsNeeded = parseInt(this.storage.getItem('motionPings')) || 1;
         const motionTimeoutDuration = (parseInt(this.storage.getItem('motionTimeout')) || 10) * 1000;
@@ -123,13 +136,8 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
 
             if (event === HikvisionDoorbellEvent.CaseTamperAlert)
             {
-                const enabled = parseBooleans (this.storage.getItem (EXPOSE_ALERT_KEY));
-                if (enabled)
-                {
-                    const provider = this.provider as HikvisionDoorbellProvider;
-                    const alert = await provider.getAlertDevice (this.nativeId);
-                    if (alert)
-                        alert.turnOn();
+                if (this.tamperAlert) {
+                    this.tamperAlert.turnOn();
                 }
                 else {
                     event = HikvisionDoorbellEvent.Motion;
@@ -186,46 +194,48 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
                 // pulseTimeout = setTimeout(() => this.binaryState = false, 3000);
                 this.binaryState = true;
                 setImmediate( () =>{
-                    this.controlEvents.emit (event);
+                    this.controlEvents.emit (event.toString());
                 });
             }
             else if (event === HikvisionDoorbellEvent.TalkHangup) 
             {
                 this.binaryState = false;
                 setImmediate( () =>{
-                    this.controlEvents.emit (event);
+                    this.controlEvents.emit (event.toString());
                 });
             }
             else if (event === HikvisionDoorbellEvent.Unlock)
             {
-                const provider = this.provider as HikvisionDoorbellProvider;
-                const lock = await provider.getLockDevice (this.nativeId);
-                if (lock) 
-                {
+                // Update all locks to unlocked state
+                for (const [nativeId, lock] of this.locks) {
                     lock.lockState = LockState.Unlocked;
+                }
 
+                if (this.locks.size > 0) {
                     clearTimeout (this.doorOpenDurationTimeout);
                     const timeout = (await this.getClient().getDoorOpenDuration()) * 1000;
                     this.doorOpenDurationTimeout = setTimeout ( async () => {
-    
-                        const provider = this.provider as HikvisionDoorbellProvider;
-                        const lock = await provider.getLockDevice (this.nativeId);
-                        if (lock) {
+                        // Update all locks to locked state after timeout
+                        for (const [nativeId, lock] of this.locks) {
                             lock.lockState = LockState.Locked;
-                            this.console.info (`Door lock was closed automatically after duration: ${timeout}`);
                         }
-                    }
-                    , timeout);
+                        this.console.info (`Door locks were closed automatically after duration: ${timeout}`);
+                    }, timeout);
                 }
                     
                 setTimeout(() => this.stopRinging(), OPEN_LOCK_AUDIO_NOTIFY_DURASTION);
             }
-            else if (event === HikvisionDoorbellEvent.DoorOpened && parseBooleans (this.storage.getItem (USE_CONTACT_SENSOR_KEY)))
+            else if (
+                (event === HikvisionDoorbellEvent.DoorOpened 
+                || event === HikvisionDoorbellEvent.DoorClosed) 
+                && parseBooleans (this.storage.getItem (USE_CONTACT_SENSOR_KEY))
+            ) 
             {
-                const provider = this.provider as HikvisionDoorbellProvider;
-                const lock = await provider.getLockDevice (this.nativeId);
-                if (lock) 
-                    lock.unlock();
+                // Update all locks based on door sensor state
+                const newState = event === HikvisionDoorbellEvent.DoorOpened ? LockState.Unlocked : LockState.Locked;
+                for (const [nativeId, lock] of this.locks) {
+                    lock.lockState = newState;
+                }
             }
         })
 
@@ -293,37 +303,135 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
     {
         const twoWayAudio = this.storage.getItem ('twoWayAudio') === 'true';
 
+        const providedDevices = JSON.parse(this.storage.getItem(PROVIDED_DEVICES_KEY) || '[]') as string[];
+
         const interfaces = this.provider.getInterfaces();
         if (twoWayAudio) {
             interfaces.push (ScryptedInterface.Intercom);
         }
         interfaces.push (ScryptedInterface.BinarySensor);
         interfaces.push (ScryptedInterface.Readme);
+        
+        if (!!providedDevices?.length) {
+            interfaces.push(ScryptedInterface.DeviceProvider);
+        }
+        
         this.provider.updateDevice (this.nativeId, this.name, interfaces, ScryptedDeviceType.Doorbell);
     }
 
-    async updateLock () 
+    override async reportDevices()
     {
-        const enabled = parseBooleans (this.storage.getItem (EXPOSE_LOCK_KEY));
-        const provider = this.provider as HikvisionDoorbellProvider;
-        if (enabled) {
-            return provider.enableLock (this.nativeId);
+        const providedDevices = JSON.parse (this.storage.getItem (PROVIDED_DEVICES_KEY) || '[]') as string[];
+        const devices: Device[] = [];
+
+        if (providedDevices?.includes ('Lock')) {
+            try {
+                const lockDevices = await this.createLockDevices();
+                devices.push (...lockDevices);
+            } catch (error) {
+                this.console.warn (`Failed to create lock devices: ${error}`);
+            }
         }
-        else {
-            return provider.disableLock (this.nativeId);
+
+        if (providedDevices?.includes ('Tamper Alert')) {
+            const alertNativeId = `${this.nativeId}-alert`;
+            const alertDevice: Device = {
+                providerNativeId: this.nativeId,
+                name: `${this.name} (Doorbell Tamper Alert)`,
+                nativeId: alertNativeId,
+                info: {
+                    ...this.info,
+                },
+                interfaces: [
+                    ScryptedInterface.OnOff,
+                    ScryptedInterface.Readme
+                ],
+                type: ScryptedDeviceType.Switch,
+            };
+            devices.push (alertDevice);
         }
+        sdk.deviceManager.onDevicesChanged ({
+            providerNativeId: this.nativeId,
+            devices,
+        });
     }
 
-    async updateAlert () 
+    private async createLockDevices(): Promise<Device[]>
     {
-        const enabled = parseBooleans (this.storage.getItem (EXPOSE_ALERT_KEY));
-        const provider = this.provider as HikvisionDoorbellProvider;
-        if (enabled) {
-            return provider.enableAlert (this.nativeId);
+        const devices: Device[] = [];
+        
+        try {
+            const client = this.getClient();
+            const doorRange = await client.getDoorControlCapabilities();
+            
+            for (let doorNo = doorRange.doorMinNo; doorNo <= doorRange.doorMaxNo; doorNo++) {
+                const lockNativeId = `${this.nativeId}-lock-${doorNo}`;
+                const lockDevice: Device = {
+                    providerNativeId: this.nativeId,
+                    name: doorRange.doorMaxNo > 1 ? `${this.name} (Door Lock ${doorNo})` : `${this.name} (Door Lock)`,
+                    nativeId: lockNativeId,
+                    info: {
+                        ...this.info,
+                    },
+                    interfaces: [
+                        ScryptedInterface.Lock,
+                        ScryptedInterface.Readme
+                    ],
+                    type: ScryptedDeviceType.Lock,
+                };
+                devices.push (lockDevice);
+            }
+        } catch (error) {
+            this.console.error (`Failed to get door capabilities: ${error}`);
+            // Fallback to single lock device
+            const lockNativeId = `${this.nativeId}-lock-1`;
+            const lockDevice: Device = {
+                providerNativeId: this.nativeId,
+                name: `${this.name} (Door Lock)`,
+                nativeId: lockNativeId,
+                info: {
+                    ...this.info,
+                },
+                interfaces: [
+                    ScryptedInterface.Lock,
+                    ScryptedInterface.Readme
+                ],
+                type: ScryptedDeviceType.Lock,
+            };
+            devices.push (lockDevice);
         }
-        else {
-            return provider.disableAlert (this.nativeId);
+        
+        return devices;
+    }
+
+
+    async getDevice (nativeId: string): Promise<any>
+    {
+        if (nativeId.includes ('-lock-')) {
+            let lock = this.locks.get (nativeId);
+            if (!lock) {
+                // Extract door number from nativeId (format: deviceId-lock-doorNo)
+                const doorNo = nativeId.split ('-lock-')[1];
+                lock = new HikvisionLock (this, nativeId, doorNo);
+                this.locks.set (nativeId, lock);
+            }
+            return lock;
         }
+        if (nativeId.endsWith ('-alert')) {
+            this.tamperAlert ||= new HikvisionTamperAlert (this, nativeId);
+            return this.tamperAlert;
+        }
+        return super.getDevice (nativeId);
+    }
+
+    async releaseDevice (id: string, nativeId: string)
+    {
+        if (nativeId.includes ('-lock-'))
+            this.locks.delete (nativeId);
+        else if (nativeId.endsWith ('-alert'))
+            delete this.tamperAlert;
+        else
+            return super.releaseDevice (id, nativeId);
     }
 
     override async putSetting(key: string, value: string) {
@@ -335,31 +443,15 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
             value = '';
         }
 
+        if (key === 'debug') {
+            // Handle both string and boolean values
+            const debugEnabled = typeof value === 'boolean' ? value : value === 'true';
+            this.debugController?.setDebugEnabled(debugEnabled);
+        }
+
         super.putSetting(key, value);
 
-        if (key === EXPOSE_LOCK_KEY) {
-            this.updateLock();
-        }
-
-        if (key === EXPOSE_ALERT_KEY) {
-            this.updateAlert();
-        }
-
-        this.updateDevice();
         this.updateSip();
-        this.updateDeviceInfo();
-    }
-
-    onLockRemoved() 
-    {
-        super.putSetting(EXPOSE_LOCK_KEY, 'false');
-        this.updateDevice();
-    }
-
-    onAlertRemoved() 
-    {
-        super.putSetting(EXPOSE_ALERT_KEY, 'false');
-        this.updateDevice();
     }
 
     override async getSettings(): Promise<Setting[]> 
@@ -383,28 +475,43 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
         return ret;
     }
 
-    override async getOtherSettings(): Promise<Setting[]> {
+    override async getOtherSettings(): Promise<Setting[]> 
+    {
         const ret = await super.getOtherSettings();
+
+        // Remove existing providedDevices entry if it exists
+        const existingIndex = ret.findIndex(setting => setting.key === PROVIDED_DEVICES_KEY);
+        if (existingIndex !== -1) {
+            ret.splice(existingIndex, 1);
+        }
+        const providedDevices = JSON.parse(this.storage.getItem(PROVIDED_DEVICES_KEY) || '[]') as string[];
+        ret.unshift(
+            {
+                key: PROVIDED_DEVICES_KEY,
+                subgroup: 'Advanced',
+                title: 'Provided devices',
+                description: 'Additional devices provided by this doorbell',
+                value: providedDevices,
+                choices: [
+                    'Lock',
+                    'Tamper Alert',
+                ],
+                multiple: true,
+            }
+        );
 
         ret.unshift(
             {
-                key: EXPOSE_LOCK_KEY,
-                title: 'Expose Door Lock Controller',
-                description: 'The doorbell may have the capability to control door opening. Enabling this feature will result in the creation of a separate (linked) device of the "Lock" type, which implements the door lock control.',
-                value: parseBooleans (this.storage.getItem (EXPOSE_LOCK_KEY)) || false,
-                type: 'boolean',
-            },
-            {
-                key: EXPOSE_ALERT_KEY,
-                title: 'Expose Tamper Alert Controller',
-                description: 'The doorbell may have a tamper alert. Enabling this function will lead to the creation of a separate (linked) device of the “Switch” type that implements tamper signaling.',
-                value: parseBooleans (this.storage.getItem (EXPOSE_ALERT_KEY)) || false,
-                type: 'boolean',
+                title: 'SIP Mode',
+                value: `<p>Setting up a way to interact with the doorbell in order to receive calls. 
+                Read more about how in this device description.</p>
+                <p><b>Warning: Be careful! Switch to "Emulated SIP Proxy" mode leads to automatic configuration of settings on the doorbell device.</b></p>
+                `,
+                type: 'html',
+                readonly: true,
             },
             {
                 key: SIP_MODE_KEY,
-                title: 'SIP Mode',
-                description: 'Setting up a way to interact with the doorbell in order to receive calls. Read more about how in this device description.',
                 choices: Object.values (SipMode),
                 combobox: true,
                 value: this.storage.getItem (SIP_MODE_KEY) || SipMode.Off,
@@ -507,7 +614,7 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
         });
 
         forwarder.killPromise.finally(() => {
-            this.console.log('audio finished');
+            console.debug('audio finished');
             passthrough.end();
             this.stopIntercom();
         });
@@ -541,7 +648,7 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
         {
             try 
             {
-                const hup = timeoutPromise (5000, once (this.controlEvents, HikvisionDoorbellEvent.TalkHangup));
+                const hup = timeoutPromise (5000, once (this.controlEvents, HikvisionDoorbellEvent.TalkHangup.toString()));
                 await Promise.all ([hup, this.sipManager.answer()])
             } catch (error) {
                 this.console.error (`Stop SIP ringing error: ${error}`);
@@ -552,8 +659,8 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
         }
     }
 
-    /// Installs fake SIP settings on physical device, 
-    /// if appropriate option is enabled (autoinstall)
+    /// Installs fake SIP settings on physical device automatically
+    /// when SIP Proxy mode is enabled
     private installSipSettingsOnDeviceTimeout: NodeJS.Timeout;
     private async installSipSettingsOnDevice()
     {
@@ -561,18 +668,20 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
         if (this.getSipMode() === SipMode.Server
             && this.sipManager) 
         {
-            const autoinstall = parseBooleans (this.storage.getItem (SIP_SERVER_INSTALL_ON_KEY))
             const ip = this.sipManager.localIp;
             const port = this.sipManager.localPort;
-            if (autoinstall) { 
-                try {
-                    await this.getClient().setFakeSip (true, ip, port)
-                    this.console.info (`Installed fake SIP settings on doorbell. Address: ${ip}, port: ${port}`);
-                } catch (e) {
-                    this.console.error (`Error installing fake SIP settings: ${e}`);
-                    // repeat if unreached
-                    this.installSipSettingsOnDeviceTimeout = setTimeout (() => this.installSipSettingsOnDevice(), UNREACHED_REPEAT_TIMEOUT);
-                }
+            const roomNumber = this.storage.getItem (SIP_SERVER_ROOM_NUMBER_KEY) || DEFAULT_ROOM_NUMBER;
+            const proxyPhone = this.storage.getItem (SIP_SERVER_PROXY_PHONE_KEY) || DEFAULT_PROXY_PHONE;
+            const doorbellPhone = this.storage.getItem (SIP_SERVER_DOORBELL_PHONE_KEY) || DEFAULT_DOORBELL_PHONE;
+            const buttonNumber = this.storage.getItem (SIP_SERVER_BUTTON_NUMBER_KEY) || DEFAULT_BUTTON_NUMBER;
+            
+            try {
+                await this.getClient().setFakeSip (ip, port, roomNumber, proxyPhone, doorbellPhone, buttonNumber)
+                this.console.info (`Installed fake SIP settings on doorbell. Address: ${ip}, port: ${port}, room: ${roomNumber}, proxy phone: ${proxyPhone}, doorbell phone: ${doorbellPhone}, button: ${buttonNumber}`);
+            } catch (e) {
+                this.console.error (`Error installing fake SIP settings: ${e}`);
+                // repeat if unreached
+                this.installSipSettingsOnDeviceTimeout = setTimeout (() => this.installSipSettingsOnDevice(), UNREACHED_REPEAT_TIMEOUT);
             }
         }
     }
@@ -630,6 +739,18 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
                 return [
                     {
                         subgroup: 'Emulate SIP Proxy',
+                        title: 'Information',
+                        description: '',
+                        value: `<p>SIP proxy is emulated on this plugin. 
+                        It allows intercepting and handling SIP calls from the doorbell device.
+                        It is used for SIP call control and monitoring. 
+                        It is not related to SIP telephony.</p>
+                        <p><b>Enabling this mode will automatically configure the necessary settings on the doorbell device!</b></p>`,
+                        type: 'html',
+                        readonly: true,
+                    },
+                    {
+                        subgroup: 'Emulate SIP Proxy',
                         key: 'sipServerIp',
                         title: 'Interface IP Address',
                         description: 'Address of the interface on which the fake SIP proxy listens. Readonly property, for information.',
@@ -648,11 +769,39 @@ class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Interco
                     },
                     {
                         subgroup: 'Emulate SIP Proxy',
-                        key: SIP_SERVER_INSTALL_ON_KEY,
-                        title: 'Autoinstall Fake SIP Proxy',
-                        description: 'Install fake SIP proxy settings on a physical device (Hikvision Doorbell) automatically',
-                        value: parseBooleans (this.storage.getItem (SIP_SERVER_INSTALL_ON_KEY)) || false,
-                        type: 'boolean'
+                        key: SIP_SERVER_ROOM_NUMBER_KEY,
+                        title: 'Room Number',
+                        description: 'Room number to be configured on the doorbell device. Must be between 1 and 9999. This room number will represent this fake SIP proxy',
+                        value: this.storage.getItem (SIP_SERVER_ROOM_NUMBER_KEY),
+                        type: 'integer',
+                        placeholder: DEFAULT_ROOM_NUMBER
+                    },
+                    {
+                        subgroup: 'Emulate SIP Proxy',
+                        key: SIP_SERVER_PROXY_PHONE_KEY,
+                        title: 'SIP Proxy Phone Number',
+                        description: 'Phone number that will represent this fake SIP proxy',
+                        value: this.storage.getItem (SIP_SERVER_PROXY_PHONE_KEY),
+                        type: 'integer',
+                        placeholder: DEFAULT_PROXY_PHONE
+                    },
+                    {
+                        subgroup: 'Emulate SIP Proxy',
+                        key: SIP_SERVER_DOORBELL_PHONE_KEY,
+                        title: 'Doorbell Phone Number',
+                        description: 'Phone number that will represent the doorbell',
+                        value: this.storage.getItem (SIP_SERVER_DOORBELL_PHONE_KEY),
+                        type: 'integer',
+                        placeholder: DEFAULT_DOORBELL_PHONE
+                    },
+                    {
+                        subgroup: 'Emulate SIP Proxy',
+                        key: SIP_SERVER_BUTTON_NUMBER_KEY,
+                        title: 'Button Number',
+                        description: 'Number of the call button. Used when doorbell has multiple call buttons. Must be between 1 and 99.',
+                        value: this.storage.getItem (SIP_SERVER_BUTTON_NUMBER_KEY),
+                        type: 'integer',
+                        placeholder: DEFAULT_BUTTON_NUMBER
                     },
                 ];
 
@@ -683,11 +832,6 @@ export class HikvisionDoorbellProvider extends RtspProvider
     static CAMERA_NATIVE_ID_KEY: string = 'cameraNativeId';
     
     clients: Map<string, HikvisionDoorbellAPI>;
-    lockDevices: Map<string, HikvisionLock>;
-    alertDevices: Map<string, HikvisionTamperAlert>;
-
-    private static LOCK_DEVICE_PREFIX = 'hik-lock:';
-    private static ALERT_DEVICE_PREFIX = 'hik-alert:';
 
     constructor() {
         super();
@@ -722,76 +866,6 @@ export class HikvisionDoorbellProvider extends RtspProvider
 
     override createCamera(nativeId: string) {
         return new HikvisionCameraDoorbell(nativeId, this);
-    }
-
-    override async getDevice (nativeId: string): Promise<any>
-    {
-        if (this.isLockId (nativeId))
-        {
-            if (typeof (this.lockDevices) === 'undefined') {
-                this.lockDevices = new Map();
-            }
-
-            let ret = this.lockDevices.get (nativeId);
-            if (!ret) 
-            {
-                ret = new HikvisionLock (nativeId, this);
-                if (ret)
-                    this.lockDevices.set(nativeId, ret);
-            }
-            return ret;
-        }
-        else if (this.isAlertId (nativeId)) 
-        {
-            if (typeof (this.alertDevices) === 'undefined') {
-                this.alertDevices = new Map();
-            }
-
-            let ret = this.alertDevices.get (nativeId);
-            if (!ret) 
-            {
-                ret = new HikvisionTamperAlert (nativeId);
-                if (ret)
-                    this.alertDevices.set(nativeId, ret);
-            }
-            return ret;
-        }
-
-        return super.getDevice (nativeId);
-    }
-
-    async getLockDevice (cameraNativeId: string): Promise<HikvisionLock>
-    {
-        const nativeId = this.lockIdFrom (cameraNativeId);
-        return this.getDevice (nativeId);
-    }
-
-    async getAlertDevice (cameraNativeId: string): Promise<HikvisionTamperAlert>
-    {
-        const nativeId = this.alertIdFrom (cameraNativeId);
-        return this.getDevice (nativeId);
-    }
-
-    override async releaseDevice(id: string, nativeId: string): Promise<void> {
-
-        this.console.error(`Release device: ${id}, ${nativeId}`);
-        const camera = this.getCameraDeviceFor (nativeId, false);
-        if (this.isLockId (nativeId))
-        {
-            camera.onLockRemoved();
-            this.lockDevices.delete (nativeId);
-            return;
-        }
-        if (this.isAlertId (nativeId))
-        {
-            camera.onAlertRemoved();
-            this.alertDevices.delete (nativeId);
-            return;
-        }
-        await this.disableLock (nativeId);
-        await this.disableAlert (nativeId);
-        this.devices.delete(nativeId);
-        camera?.destroy();
     }
 
     override async createDevice(settings: DeviceCreatorSettings, nativeId?: string): Promise<string> {
@@ -842,155 +916,6 @@ export class HikvisionDoorbellProvider extends RtspProvider
         device.updateSip();
         device.updateDeviceInfo();
         return nativeId;
-    }
-
-    async enableLock (cameraNativeId: string)
-    {
-        const camera = await this.getCameraDeviceFor (cameraNativeId)
-        const nativeId = this.lockIdFrom (cameraNativeId);
-        const name = `${camera.name} (Door Lock)`
-        await this.updateLock (nativeId, name);
-        await this.cameraMetaToAux (nativeId, camera);
-    }
-
-    async disableLock (cameraNativeId: string)
-    {
-        const nativeId = this.lockIdFrom (cameraNativeId);
-        return this.removingAuxNotify (nativeId)
-    }
-
-    async updateLock (nativeId: string, name?: string)
-    {
-        await deviceManager.onDeviceDiscovered({
-            nativeId,
-            name,
-            interfaces: HikvisionLock.deviceInterfaces,
-            type: ScryptedDeviceType.Lock
-        });
-
-    }
-
-    async enableAlert (cameraNativeId: string)
-    {
-        const camera = await this.getCameraDeviceFor (cameraNativeId)
-        const nativeId = this.alertIdFrom (cameraNativeId);
-        const name = `${camera.name} (Doorbell Tamper Alert)`
-        await this.updateAlert (nativeId, name);
-        await this.cameraMetaToAux (nativeId, camera);
-    }
-
-    async disableAlert (cameraNativeId: string)
-    {
-        const nativeId = this.alertIdFrom (cameraNativeId);
-        return this.removingAuxNotify (nativeId)
-    }
-
-    async updateAlert (nativeId: string, name?: string)
-    {
-        await deviceManager.onDeviceDiscovered({
-            nativeId,
-            name,
-            interfaces: HikvisionTamperAlert.deviceInterfaces,
-            type: ScryptedDeviceType.Switch
-        });
-
-    }
-
-    private async cameraMetaToAux (nativeId: string, camera: HikvisionCameraDoorbell)
-    {
-        const user = camera.storage.getItem ('username');
-        const pass = camera.storage.getItem ('password');
-        const aux = await this.getDevice (nativeId) as Settings;
-        aux.putSetting ('user', user);
-        aux.putSetting ('pass', pass);
-        aux.putSetting ('ip', camera.getIPAddress());
-        aux.putSetting ('port', camera.getHttpPort());
-        aux.putSetting (HikvisionDoorbellProvider.CAMERA_NATIVE_ID_KEY, camera.nativeId);
-    }
-
-    private async removingAuxNotify (nativeId: string)
-    {
-        const state = deviceManager.getDeviceState (nativeId);
-        if (state?.nativeId === nativeId) {
-            return deviceManager.onDeviceRemoved (nativeId)
-        }
-    }
-
-    override async getCreateDeviceSettings(): Promise<Setting[]> {
-        return [
-            {
-                key: 'username',
-                title: 'Username',
-            },
-            {
-                key: 'password',
-                title: 'Password',
-                type: 'password',
-            },
-            {
-                key: 'ip',
-                title: 'IP Address',
-                placeholder: '192.168.2.222',
-            },
-            {
-                key: 'httpPort',
-                title: 'HTTP Port',
-                description: 'Optional: Override the HTTP Port from the default value of 80',
-                placeholder: '80',
-            },
-            {
-                key: 'skipValidate',
-                title: 'Skip Validation',
-                description: 'Add the device without verifying the credentials and network settings.',
-                type: 'boolean',
-            }
-        ]
-    }
-
-    private lockIdFrom (cameraNativeId: string): string {
-        return `${HikvisionDoorbellProvider.LOCK_DEVICE_PREFIX}${cameraNativeId}`
-    }
-    
-    private alertIdFrom (cameraNativeId: string): string {
-        return `${HikvisionDoorbellProvider.ALERT_DEVICE_PREFIX}${cameraNativeId}`
-    }
-
-    private isLockId (nativeId: string):boolean {
-        return nativeId.startsWith (HikvisionDoorbellProvider.LOCK_DEVICE_PREFIX);
-    }
-
-    private isAlertId (nativeId: string):boolean {
-        return nativeId.startsWith (HikvisionDoorbellProvider.ALERT_DEVICE_PREFIX);
-    }
-
-    private cameraIdFrom (nativeId: string): string 
-    {
-        if (this.isLockId (nativeId)) {
-            return nativeId.substring (HikvisionDoorbellProvider.LOCK_DEVICE_PREFIX.length);
-        }
-        if (this.isAlertId (nativeId)) {
-            return nativeId.substring (HikvisionDoorbellProvider.ALERT_DEVICE_PREFIX.length);
-        }
-        return nativeId;
-    }
-
-    private getCameraDeviceFor (nativeId, check: boolean = true): HikvisionCameraDoorbell
-    {
-        try 
-        {
-            const cameraId = this.cameraIdFrom (nativeId);
-            if (check)
-            {
-                const state = deviceManager.getDeviceState (cameraId);
-                if (state?.nativeId !== cameraId)
-                    return null;
-            }
-            return this.devices?.get (cameraId);
-        } catch (error) 
-        {
-            this.console.warn (`Error obtaining camera device: ${error}`);
-            return null;
-        }
     }
 }
 
