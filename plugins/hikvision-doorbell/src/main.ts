@@ -10,6 +10,7 @@ import { parseBooleans, parseNumbers } from "xml2js/lib/processors";
 import { once, EventEmitter } from 'node:events';
 import { timeoutPromise } from "@scrypted/common/src/promise-utils";
 import { HikvisionLock } from "./lock"
+import { HikvisionEntrySensor } from "./entry-sensor"
 import { HikvisionTamperAlert } from "./tamper-alert"
 import * as fs from 'fs/promises';
 import { join } from 'path';
@@ -19,7 +20,6 @@ const { mediaManager, deviceManager } = sdk;
 
 const PROVIDED_DEVICES_KEY: string = 'providedDevices';
 
-const USE_CONTACT_SENSOR_KEY: string = 'useContactSensor';
 
 const SIP_MODE_KEY: string = 'sipMode';
 const SIP_CLIENT_CALLID_KEY: string = 'sipClientCallId';
@@ -55,6 +55,7 @@ enum SipMode {
 
 export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, Intercom, Reboot, Readme {
     locks: Map<string, HikvisionLock> = new Map();
+    entrySensors: Map<string, HikvisionEntrySensor> = new Map();
     tamperAlert?: HikvisionTamperAlert;
     sipManager?: SipManager;
 
@@ -132,7 +133,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         let motionPingsNeeded = parseInt(this.storage.getItem('motionPings')) || 1;
         const motionTimeoutDuration = (parseInt(this.storage.getItem('motionTimeout')) || 10) * 1000;
         let motionPings = 0;
-        events.on('event', async (event: HikvisionDoorbellEvent, cameraNumber: string, inactive: boolean) => {
+        events.on('event', async (event: HikvisionDoorbellEvent, doorNo: string) => {
 
             if (event === HikvisionDoorbellEvent.CaseTamperAlert)
             {
@@ -145,41 +146,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             }
             if (event === HikvisionDoorbellEvent.Motion) 
             {
-                // check if the camera+channel field is in use, and filter events.
-                if (this.getRtspChannel()) {
-                    // it is possible to set it up to use a camera number
-                    // on an nvr IP (which gives RTSP urls through the NVR), but then use a http port
-                    // that gives a filtered event stream from only that camera.
-                    // this this case, the camera numbers will not
-                    // match as they will be always be "1".
-                    // to detect that a camera specific endpoint is being used
-                    // can look at the channel ids, and see if that camera number is found.
-                    // this is different from the use case where the NVR or camera
-                    // is using a port other than 80 (the default).
-                    // could add a setting to have the user explicitly denote nvr usage
-                    // but that is error prone.
-                    const userCameraNumber = this.getCameraNumber();
-                    if (ignoreCameraNumber === undefined && this.detectedChannels) {
-                        const channelIds = (await this.detectedChannels).keys();
-                        ignoreCameraNumber = true;
-                        for (const id of channelIds) {
-                            if (channelToCameraNumber(id) === userCameraNumber) {
-                                ignoreCameraNumber = false;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!ignoreCameraNumber && cameraNumber !== userCameraNumber) {
-                        // this.console.error(`### Skipping motion event ${cameraNumber} != ${this.getCameraNumber()}`);
-                        return;
-                    }
-                }
-
                 motionPings++;
-                // this.console.log(this.name, 'motion pings', motionPings);
-
-                // this.console.error('### Detected motion, camera: ', cameraNumber);
                 this.motionDetected = motionPings >= motionPingsNeeded;
                 clearTimeout(motionTimeout);
                 // motion seems to be on a 1 second pulse
@@ -190,8 +157,6 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             }
             else if (event === HikvisionDoorbellEvent.TalkInvite) 
             {
-                // clearTimeout(pulseTimeout);
-                // pulseTimeout = setTimeout(() => this.binaryState = false, 3000);
                 this.binaryState = true;
                 setImmediate( () =>{
                     this.controlEvents.emit (event.toString());
@@ -204,37 +169,48 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                     this.controlEvents.emit (event.toString());
                 });
             }
-            else if (event === HikvisionDoorbellEvent.Unlock)
+            else if (event === HikvisionDoorbellEvent.Unlock 
+                || event === HikvisionDoorbellEvent.Lock)
             {
-                // Update all locks to unlocked state
-                for (const [nativeId, lock] of this.locks) {
-                    lock.lockState = LockState.Unlocked;
-                }
-
-                if (this.locks.size > 0) {
-                    clearTimeout (this.doorOpenDurationTimeout);
-                    const timeout = (await this.getClient().getDoorOpenDuration()) * 1000;
-                    this.doorOpenDurationTimeout = setTimeout ( async () => {
-                        // Update all locks to locked state after timeout
-                        for (const [nativeId, lock] of this.locks) {
-                            lock.lockState = LockState.Locked;
-                        }
-                        this.console.info (`Door locks were closed automatically after duration: ${timeout}`);
-                    }, timeout);
-                }
+                // Update specific lock based on doorNo
+                const lockNativeId = `${this.nativeId}-lock-${doorNo}`;
+                const lock = this.locks.get (lockNativeId);
+                
+                if (lock) {
+                    const isUnlock = event === HikvisionDoorbellEvent.Unlock;
+                    lock.lockState = isUnlock ? LockState.Unlocked : LockState.Locked;
+                    this.console.info (`Door ${doorNo} ${isUnlock ? 'unlocked' : 'locked'}`);
                     
-                setTimeout(() => this.stopRinging(), OPEN_LOCK_AUDIO_NOTIFY_DURASTION);
+                    clearTimeout (this.doorOpenDurationTimeout);
+                    
+                    if (isUnlock) {
+                        const timeout = (await this.getClient().getDoorOpenDuration (doorNo)) * 1000;
+                        this.doorOpenDurationTimeout = setTimeout ( async () => {
+                            lock.lockState = LockState.Locked;
+                            this.console.info (`Door ${doorNo} locked automatically after duration: ${timeout}ms`);
+                        }, timeout);
+                        
+                        setTimeout(() => this.stopRinging(), OPEN_LOCK_AUDIO_NOTIFY_DURASTION);
+                    }
+                } else {
+                    this.console.warn (`Lock for door ${doorNo} not found`);
+                }
             }
             else if (
                 (event === HikvisionDoorbellEvent.DoorOpened 
-                || event === HikvisionDoorbellEvent.DoorClosed) 
-                && parseBooleans (this.storage.getItem (USE_CONTACT_SENSOR_KEY))
+                || event === HikvisionDoorbellEvent.DoorClosed)
             ) 
             {
-                // Update all locks based on door sensor state
-                const newState = event === HikvisionDoorbellEvent.DoorOpened ? LockState.Unlocked : LockState.Locked;
-                for (const [nativeId, lock] of this.locks) {
-                    lock.lockState = newState;
+                // Update specific entry sensor based on door state and doorNo
+                const sensorNativeId = `${this.nativeId}-entry-${doorNo}`;
+                const entrySensor = this.entrySensors.get (sensorNativeId);
+                
+                if (entrySensor) {
+                    const isOpen = event === HikvisionDoorbellEvent.DoorOpened;
+                    entrySensor.binaryState = isOpen;
+                    this.console.info (`Door ${doorNo} sensor: ${isOpen ? 'opened' : 'closed'}`);
+                } else {
+                    this.console.warn (`Entry sensor for door ${doorNo} not found`);
                 }
             }
         })
@@ -324,12 +300,21 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         const providedDevices = JSON.parse (this.storage.getItem (PROVIDED_DEVICES_KEY) || '[]') as string[];
         const devices: Device[] = [];
 
-        if (providedDevices?.includes ('Lock')) {
+        if (providedDevices?.includes ('Locks')) {
             try {
                 const lockDevices = await this.createLockDevices();
                 devices.push (...lockDevices);
             } catch (error) {
                 this.console.warn (`Failed to create lock devices: ${error}`);
+            }
+        }
+
+        if (providedDevices?.includes ('Contact Sensors')) {
+            try {
+                const sensorDevices = await this.createEntrySensorDevices();
+                devices.push(...sensorDevices);
+            } catch (error) {
+                this.console.warn (`Failed to create entry sensor devices: ${error}`);
             }
         }
 
@@ -404,6 +389,55 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         return devices;
     }
 
+    private async createEntrySensorDevices(): Promise<Device[]>
+    {
+        const devices: Device[] = [];
+        
+        try 
+        {
+            const client = this.getClient();
+            const doorRange = await client.getDoorControlCapabilities();
+            
+            for (let doorNo = doorRange.doorMinNo; doorNo <= doorRange.doorMaxNo; doorNo++) {
+                const sensorNativeId = `${this.nativeId}-entry-${doorNo}`;
+                const sensorDevice: Device = {
+                    providerNativeId: this.nativeId,
+                    name: doorRange.doorMaxNo > 1 ? `${this.name} (Contact Sensor ${doorNo})` : `${this.name} (Contact Sensor)`,
+                    nativeId: sensorNativeId,
+                    info: {
+                        ...this.info,
+                    },
+                    interfaces: [
+                        ScryptedInterface.BinarySensor,
+                        ScryptedInterface.Readme
+                    ],
+                    type: ScryptedDeviceType.Sensor,
+                };
+                devices.push (sensorDevice);
+            }
+        } catch (error) {
+            this.console.error (`Failed to get door capabilities: ${error}`);
+            // Fallback to single entry sensor device
+            const sensorNativeId = `${this.nativeId}-entry-1`;
+            const sensorDevice: Device = {
+                providerNativeId: this.nativeId,
+                name: `${this.name} (Contact Sensor)`,
+                nativeId: sensorNativeId,
+                info: {
+                    ...this.info,
+                },
+                interfaces: [
+                    ScryptedInterface.BinarySensor,
+                    ScryptedInterface.Readme
+                ],
+                type: ScryptedDeviceType.Sensor,
+            };
+            devices.push (sensorDevice);
+        }
+        
+        return devices;
+    }
+
 
     async getDevice (nativeId: string): Promise<any>
     {
@@ -417,6 +451,16 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             }
             return lock;
         }
+        if (nativeId.includes ('-entry-')) {
+            let entrySensor = this.entrySensors.get (nativeId);
+            if (!entrySensor) {
+                // Extract door number from nativeId (format: deviceId-entry-doorNo)
+                const doorNo = nativeId.split ('-entry-')[1];
+                entrySensor = new HikvisionEntrySensor (this, nativeId, doorNo);
+                this.entrySensors.set (nativeId, entrySensor);
+            }
+            return entrySensor;
+        }
         if (nativeId.endsWith ('-alert')) {
             this.tamperAlert ||= new HikvisionTamperAlert (this, nativeId);
             return this.tamperAlert;
@@ -428,6 +472,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     {
         if (nativeId.includes ('-lock-'))
             this.locks.delete (nativeId);
+        else if (nativeId.includes ('-entry-'))
+            this.entrySensors.delete (nativeId);
         else if (nativeId.endsWith ('-alert'))
             delete this.tamperAlert;
         else
@@ -493,7 +539,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 description: 'Additional devices provided by this doorbell',
                 value: providedDevices,
                 choices: [
-                    'Lock',
+                    'Locks',
+                    'Contact Sensors',
                     'Tamper Alert',
                 ],
                 multiple: true,
@@ -536,14 +583,6 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 description: 'Number of motion pings needed to trigger motion.',
                 value: parseInt(this.storage.getItem('motionPings')) || 1,
                 type: 'number',
-            },
-            {
-                subgroup: 'Advanced',
-                key: USE_CONTACT_SENSOR_KEY,
-                title: 'Use Contact Sensor',
-                description: "If you installed a contact sensor on the door when installing the Hikvision doorbell, you can use its status data to control the status of the doorlock controller, which you enabled in General Tab (\"Expose Door Lock Controller\" checkbox). To do this, enable this checkbox.",
-                value: parseBooleans (this.storage.getItem (USE_CONTACT_SENSOR_KEY)) || false,
-                type: 'boolean',
             },
         );
 

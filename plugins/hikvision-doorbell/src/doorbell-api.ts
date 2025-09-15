@@ -33,6 +33,7 @@ interface AcsEventInfo {
     time: string;
     remoteHostAddr: string;
     mask: string;
+    doorNo?: number;
 }
 
 interface AcsEventResponse {
@@ -45,10 +46,10 @@ interface AcsEventResponse {
     };
 } 
 
-const isapiEventListenerID: String = "1"; // Other value than '1' does not work in KV6113
 const maxEventAgeSeconds = 30; // Ignore events older than this many seconds
-const callStatusPollingTimeoutSeconds = 3 * 60; // Auto-stop call status polling after 3 minutes
-const acsEventPollingIntervalSeconds = 1.3; // ACS event polling interval in seconds, must be greater than 1 second
+const callPollingTimeoutSec = 3 * 60; // Auto-stop call status polling after 3 minutes
+const callPollingIntervalSec = 1; // Call status polling interval in seconds
+const acsPollingIntervalSec = 1.3; // ACS event polling interval in seconds, must be greater than 1 second
 
 const EventCodeMap = new Map<string, HikvisionDoorbellEvent>([
     ['5,25', HikvisionDoorbellEvent.DoorOpened],
@@ -56,7 +57,7 @@ const EventCodeMap = new Map<string, HikvisionDoorbellEvent>([
     ['5,92', HikvisionDoorbellEvent.DoorAbnormalOpened],
     ['1,3', HikvisionDoorbellEvent.Motion],
     ['1,2', HikvisionDoorbellEvent.CaseTamperAlert],
-    ['5,214', HikvisionDoorbellEvent.Unlock],
+    ['5,21', HikvisionDoorbellEvent.Unlock],
     ['5,9', HikvisionDoorbellEvent.AccessDenied],
     ['5,22', HikvisionDoorbellEvent.Lock],
 ]);
@@ -623,10 +624,10 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
                     this.console.debug(`Call state changed: ${this.lastCallState} -> ${callState}`);
                     
                     if (callState === 'ringing' && this.lastCallState === 'idle') {
-                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkInvite, '1', false);
+                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkInvite);
                         this.console.debug ('Doorbell ringing detected via polling');
                     } else if (this.lastCallState === 'ringing' && callState === 'idle') {
-                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkHangup, '1', false);
+                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkHangup);
                         this.console.debug ('Doorbell hangup detected via polling');
                     }
                     
@@ -635,7 +636,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             } catch (e) {
                 this.console.warn (`Call status polling error: ${e}`);
             }
-        }, 1000); // Check every second
+        }, callPollingIntervalSec * 1000);
 
         this.resetCallStatusPollingTimeout();
     }
@@ -650,8 +651,8 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         // Set new timeout
         this.callStatusStopTimeout = setTimeout(() => {
             this.stopCallStatusPolling();
-            this.console.debug (`Call status polling stopped automatically after ${callStatusPollingTimeoutSeconds} seconds of no motion`);
-        }, callStatusPollingTimeoutSeconds * 1000);
+            this.console.debug (`Call status polling stopped automatically after ${callPollingTimeoutSec} seconds of no motion`);
+        }, callPollingTimeoutSec * 1000);
     }
 
     private stopCallStatusPolling()
@@ -665,116 +666,6 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             this.callStatusStopTimeout = undefined;
         }
         this.isCallPollingActive = false;
-    }
-
-    async listenAlertStream()
-    {
-        try {
-            const { body } = await this.request({
-                url: `http://${this.endpoint}/ISAPI/Event/notification/alertStream`,
-                responseType: 'readable',
-                headers: {
-                    'Accept': '*/*'
-                }
-            });
-    
-            const readable = body as Readable;
-            let buffer = '';
-    
-            readable.on('data', (chunk: Buffer) => {
-                buffer += chunk.toString ('utf8');
-                
-                // Parse multipart boundary content
-                const parts = buffer.split ('--MIME_boundary');
-                buffer = parts.pop() || ''; // Keep incomplete part
-                
-                for (const part of parts) {
-                    if (!part.trim()) continue;
-                    
-                    // Extract JSON from multipart section
-                    const jsonMatch = part.match(/Content-Type: application\/json[^{]*(\{.*\})/s);
-                    if (jsonMatch) {
-                        try {
-                            const eventData = JSON.parse (jsonMatch[1]);
-                            this.processAlertStreamEvent (eventData);
-                        } catch (pe) {
-                            this.console.warn(`Failed to parse alertStream JSON: ${pe}`);
-                        }
-                    }
-                }
-            });
-    
-            readable.on ('error', (err) => {
-                this.console.error (`alertStream error: ${err}`);
-                this.emitEvent ('error', err);
-            });
-    
-            readable.on ('close', () => {
-                this.console.debug ('alertStream closed');
-                this.emitEvent ('close');
-            });
-    
-        } catch (err) {
-            this.console.error (`listenAlertStream failed: ${err}`);
-            throw err;
-        }
-    }
-
-    processAlertStreamEvent (eventData: any)
-    {
-        const cameraNumber = eventData.channelID?.toString() || '1';
-        const eventType = eventData.eventType || '';
-        const eventState = eventData.eventState || '';
-        const inactive = eventState === 'inactive';
-    
-        this.console.debug(`AlertStream event: ${eventType} (${eventState})`);
-
-        // Check if event is too old (ignore events older than 30 seconds)
-        if (eventData.dateTime) {
-            const eventTime = new Date (eventData.dateTime);
-            const now = new Date();
-            const ageInSeconds = (now.getTime() - eventTime.getTime()) / 1000;
-            
-            if (ageInSeconds > maxEventAgeSeconds) {
-                this.console.debug (`Ignoring old event: ${ageInSeconds.toFixed (1)}s old`);
-                return;
-            }
-        }
-    
-        // Map JSON events to existing HikvisionDoorbellEvent enum
-        if (eventType === 'videoloss') {
-            // Video loss events - not typically used for doorbell
-            return;
-        }
-
-        this.console.debug (`AlertStream JSON: ${JSON.stringify (eventData, null, 2)}`);
-    
-        // AccessControllerEvent contains doorbell-specific events
-        if (eventType === 'AccessControllerEvent' && eventData.AccessControllerEvent) {
-            const ace = eventData.AccessControllerEvent;
-            const majorType = ace.majorEventType;
-            const subType = ace.subEventType;
-    
-            // Use EventCodeMap to find matching event
-            const eventKey = `${majorType},${subType}`;
-            const doorbellEvent = EventCodeMap.get (eventKey);
-            
-            if (doorbellEvent !== undefined) {
-                this.emitEvent ('event', doorbellEvent, cameraNumber, inactive);
-                this.console.debug (`Door event detected: ${HikvisionDoorbellEvent[doorbellEvent]} (${eventKey})`);
-                
-                // Start call polling when motion is detected (only if active)
-                if (doorbellEvent === HikvisionDoorbellEvent.Motion && !inactive) {
-                    this.startCallStatusPolling();
-                }
-            } else {
-                this.console.info (`Unknown AccessControllerEvent: majorType=${majorType}, subType=${subType}`);
-            }
-            return;
-        }
-    
-        // Log any other unknown event types
-        this.console.info (`Unhandled event type: ${eventType}`);
     }
 
     /**
@@ -924,12 +815,11 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         }
         
         if (doorbellEvent !== undefined) {
-            // For polling events, we assume they are always 'active' (not inactive)
-            const inactive = false;
-            const cameraNumber = '1'; // Default channel for doorbell
+            // Extract door number from event
+            const doorNo = eventInfo.doorNo ? eventInfo.doorNo.toString() : '1';
             
-            this.emitEvent ('event', doorbellEvent, cameraNumber, inactive);
-            this.console.debug (`ACS polling event detected: ${HikvisionDoorbellEvent[doorbellEvent]} (${eventKey})`);
+            this.emitEvent ('event', doorbellEvent, doorNo);
+            this.console.debug (`ACS polling event detected: ${HikvisionDoorbellEvent[doorbellEvent]} (${eventKey}) door=${doorNo}`);
             
             // Start call polling when motion is detected
             if (doorbellEvent === HikvisionDoorbellEvent.Motion) {
@@ -983,7 +873,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     
     /**
      * Start periodic ACS event polling
-     * Polls for new events every 3 seconds using the stored last event time
+     * Polls for new events using the stored last event time
      */
     private startAcsEventPolling(): void
     {
@@ -992,7 +882,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             return;
         }
         
-        this.console.info ('Starting ACS event polling (every 3 seconds)');
+        this.console.info (`Starting ACS event polling (every ${acsPollingIntervalSec} seconds)`);
         
         this.acsEventPollingInterval = setInterval (async () => {
             try {
@@ -1000,7 +890,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             } catch (error) {
                 this.console.warn (`ACS event polling error: ${error}`);
             }
-        }, acsEventPollingIntervalSeconds * 1000);
+        }, acsPollingIntervalSec * 1000);
     }
     
     /**

@@ -22,13 +22,11 @@ export class HikvisionLock extends ScryptedDeviceBase implements Lock, Readme {
         const capabilities = await this.getClient().getDoorControlCapabilities();
         const command = capabilities.availableCommands.includes ('close') ? 'close' : 'resume';
         await this.getClient().controlDoor (this.doorNumber, command);
-        this.lockState = LockState.Locked;
     }
 
     async unlock(): Promise<void>
     {
         await this.getClient().controlDoor (this.doorNumber, 'open');
-        this.lockState = LockState.Unlocked;
     }
 
     private getClient(): HikvisionDoorbellAPI {

@@ -1,14 +1,15 @@
-import { EntrySensor, Readme, ScryptedDeviceBase, ScryptedInterface } from "@scrypted/sdk";
+import { BinarySensor, Readme, ScryptedDeviceBase, ScryptedInterface } from "@scrypted/sdk";
 import { HikvisionDoorbellAPI } from "./doorbell-api";
 import type { HikvisionCameraDoorbell } from "./main";
 import * as fs from 'fs/promises';
 import { join } from 'path';
 
-export class HikvisionEntrySensor extends ScryptedDeviceBase implements EntrySensor, Readme {
+export class HikvisionEntrySensor extends ScryptedDeviceBase implements BinarySensor, Readme {
 
-    constructor(public camera: HikvisionCameraDoorbell, nativeId: string) {
+    constructor(public camera: HikvisionCameraDoorbell, nativeId: string, public doorNumber: string = '1') 
+    {
         super (nativeId);
-        this.entryOpen = this.entryOpen || false;
+        this.binaryState = this.binaryState || false;
     }
 
     async getReadmeMarkdown(): Promise<string> 
@@ -23,7 +24,7 @@ export class HikvisionEntrySensor extends ScryptedDeviceBase implements EntrySen
     }
 
     static deviceInterfaces: string[] = [
-        ScryptedInterface.EntrySensor,
+        ScryptedInterface.BinarySensor,
         ScryptedInterface.Readme
     ];
 }
