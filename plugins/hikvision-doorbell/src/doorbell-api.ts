@@ -2,16 +2,15 @@ import { HikvisionCameraAPI } from "../../hikvision/src/hikvision-camera-api"
 import { HttpFetchOptions } from '@scrypted/common/src/http-auth-fetch';
 import { Readable, PassThrough } from 'stream';
 import { MediaStreamOptions } from '@scrypted/sdk';
-import net, { Server } from 'net';
-import { AddressInfo } from 'net';
+import { Server } from 'net';
 import { Destroyable } from "../../rtsp/src/rtsp";
 import { EventEmitter } from 'events';
 import { getDeviceInfo } from './probe';
 import { AuthRequestOptions, AuthRequst, AuthRequestBody } from './auth-request'
 import { OutgoingHttpHeaders } from 'http';
-import { localServiceIpAddress } from './utils';
 import libip from 'ip';
 import xml2js from 'xml2js';
+import { HttpFetchResponse } from "@scrypted/server/src/fetch";
 
 
 export enum HikvisionDoorbellEvent {
@@ -19,6 +18,7 @@ export enum HikvisionDoorbellEvent {
     CaseTamperAlert,
     TalkInvite,
     TalkHangup,
+    TalkOnCall,
     Unlock,
     Lock,
     DoorOpened,
@@ -56,7 +56,7 @@ const EventCodeMap = new Map<string, HikvisionDoorbellEvent>([
     ['5,26', HikvisionDoorbellEvent.DoorClosed], 
     ['5,92', HikvisionDoorbellEvent.DoorAbnormalOpened],
     ['1,3', HikvisionDoorbellEvent.Motion],
-    ['1,2', HikvisionDoorbellEvent.CaseTamperAlert],
+    ['1,1028', HikvisionDoorbellEvent.CaseTamperAlert],
     ['5,21', HikvisionDoorbellEvent.Unlock],
     ['5,9', HikvisionDoorbellEvent.AccessDenied],
     ['5,22', HikvisionDoorbellEvent.Lock],
@@ -92,6 +92,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
 
     private eventServer?: Server;
     private listener?: Destroyable;
+    private requestQueue: Promise<any> = Promise.resolve();
     
     // Door control capabilities
     private doorMinNo: number = 1;
@@ -121,22 +122,38 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
 
     override async request (urlOrOptions: string | HttpFetchOptions<Readable>, body?: AuthRequestBody)
     {
-
-        let url: string = urlOrOptions as string;
-        let opt: AuthRequestOptions;
-        if (typeof urlOrOptions !== 'string') {
-            url = urlOrOptions.url as string;
-            if (typeof urlOrOptions.url !== 'string') {
-                url = (urlOrOptions.url as URL).toString();
+        // Create a promise for this specific request to prevent queue blocking
+        const requestPromise = this.requestQueue.then(async () => {
+            let url: string = urlOrOptions as string;
+            let opt: AuthRequestOptions | undefined;
+            if (typeof urlOrOptions !== 'string') {
+                url = urlOrOptions.url as string;
+                if (typeof urlOrOptions.url !== 'string') {
+                    url = (urlOrOptions.url as URL).toString();
+                }
+                opt = {
+                    method: urlOrOptions.method,
+                    responseType: urlOrOptions.responseType || 'buffer',
+                    headers: urlOrOptions.headers as OutgoingHttpHeaders,
+                };
             }
-            opt = {
-                method: urlOrOptions.method,
-                responseType: urlOrOptions.responseType || 'buffer',
-                headers: urlOrOptions.headers as OutgoingHttpHeaders
-            }
-        }
 
-        return await this.auth.request(url, opt, body);
+            // Safety fallback and attach debug id
+            if (!opt) {
+                opt = { responseType: 'buffer' } as AuthRequestOptions;
+            }
+
+            return await this.auth.request(url, opt, body);
+        });
+
+        // Update the queue to continue after this request (success or failure)
+        // This prevents failed requests from blocking the entire queue
+        this.requestQueue = requestPromise.catch(() => {
+            // Swallow errors in the queue chain to prevent blocking subsequent requests
+            // The actual error is still propagated to the caller via requestPromise
+        });
+
+        return requestPromise;
     }
 
     override async getDeviceInfo() {
@@ -165,9 +182,14 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         try {
             this.listener.emit(eventName, ...args);
         } catch (error) {
+            this.console.warn(`Event emission failed, retrying in 250ms: ${error}`);
             setTimeout(() => {
                 if (this.listener) {
-                    this.listener.emit(eventName, ...args);
+                    try {
+                        this.listener.emit(eventName, ...args);
+                    } catch (retryError) {
+                        this.console.error(`Event emission retry failed: ${retryError}`);
+                    }
                 }
             }, 250);    
         }
@@ -242,19 +264,40 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     {
 
         const open = `http://${this.endpoint}/ISAPI/System/TwoWayAudio/channels/${channel}/open`;
-        const { body } = await this.request({
+        let response = await this.request({
             url: open,
             responseType: 'text',
             method: 'PUT',
         });
-        console.debug ('two way audio opened', body);
+        
+        // Check for error responses before proceeding
+        const parsedXml = await this.checkResponseStatus (response, 'Open two-way audio');
+        
+        this.console.debug ('two way audio opened', response.body);
 
-        const url = `http://${this.endpoint}/ISAPI/System/TwoWayAudio/channels/${channel}/audioData`;
-        console.debug ('posting audio data to', url);
+        // Extract sessionId from XML response
+        let sessionId: string | undefined;
+        if (parsedXml) 
+        {
+            sessionId = parsedXml.TwoWayAudioSession?.sessionId?.[0];
+            if (sessionId) 
+            {
+                this.console.debug (`Extracted sessionId: ${sessionId}`);
+            }
+            else {
+                this.console.debug ('No sessionId found in response');
+            }
+        }
 
-        return this.request({
+        const url = `http://${this.endpoint}/ISAPI/System/TwoWayAudio/channels/${channel}/audioData${sessionId ? `?sessionId=${sessionId}` : ''}`;
+        this.console.debug ('Posting audio data to', url);
+
+        // IMPORTANT: Use responseType 'readable' so AuthRequst does not wait for full body
+        // and resolves on headers. Otherwise, a long-lived PUT keeps the queue blocked
+        // and delays hangUp call behind this request.
+        response = await this.request({
             url,
-            responseType: 'text',
+                responseType: 'readable',
             headers: {
                 'Content-Type': 'application/octet-stream',
                 'Connection': 'keep-alive',
@@ -262,16 +305,31 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             },
             method: 'PUT'
         }, passthrough);
+
+        const result = new Promise<HttpFetchResponse<any>> ((resolve, reject) => {
+            const result: HttpFetchResponse<any> = response;
+            result.body.on ('end', () => resolve(result));
+            result.body.on ('error', () => reject(result));
+        });
+        return {
+            sessionId,
+            result
+        }
     }
 
-    async closeTwoWayAudio (channel: string)
+    async closeTwoWayAudio (channel: string, sessionId?: string)
     {
 
-        await this.request({
-            url: `http://${this.endpoint}/ISAPI/System/TwoWayAudio/channels/${channel}/close`,
+        const response = await this.request({
+            url: `http://${this.endpoint}/ISAPI/System/TwoWayAudio/channels/${channel}/close${sessionId ? `?sessionId=${sessionId}` : ''}`,
             method: 'PUT',
             responseType: 'text',
         });
+        
+        // Check for error responses before proceeding
+        await this.checkResponseStatus (response, 'Close two-way audio');
+        
+        this.console.debug('Two way audio closed for channel', channel);
     }
 
     rtspUrlFor (endpoint: string, channelId: string, params: string): string {
@@ -427,20 +485,37 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         }
     }
 
-    async stopRinging() 
+    async answerCall() 
     {
-        let resp = await this.request({
+        const resp = await this.request({
             url: `http://${this.endpoint}/ISAPI/VideoIntercom/callSignal?format=json`,
             method: 'PUT',
             responseType: 'text',
         }, '{"CallSignal":{"cmdType":"answer"}}');
-        console.debug(`(stopRinging) Answer return: ${resp.statusCode} - ${resp.body}`);
-        resp = await this.request({
+        this.console.debug (`(answer) Answer return: ${resp.statusCode} - ${resp.body}`);
+    }
+
+    async hangUpCall()
+    {
+        this.console.debug ('(hangUpCall) Starting hangUp request');
+        const resp = await this.request({
             url: `http://${this.endpoint}/ISAPI/VideoIntercom/callSignal?format=json`,
             method: 'PUT',
             responseType: 'text',
         }, '{"CallSignal":{"cmdType":"hangUp"}}');
-        console.debug(`(stopRinging) HangUp return: ${resp.statusCode} - ${resp.body}`);
+        this.console.debug (`(hangUpCall) HangUp return: ${resp.statusCode} - ${resp.body}`);
+        return resp;
+    }
+
+    async rejectCall()
+    {
+        const resp = await this.request({
+            url: `http://${this.endpoint}/ISAPI/VideoIntercom/callSignal?format=json`,
+            method: 'PUT',
+            responseType: 'text',
+        }, '{"CallSignal":{"cmdType":"reject"}}');
+        this.console.debug (`(reject) Reject return: ${resp.statusCode} - ${resp.body}`);
+        return resp;
     }
 
     async setFakeSip (
@@ -582,7 +657,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     // Timezone properties
     private deviceTimezone?: string; // GMT offset in format like '+03:00'
     
-    async getCallStatus(): Promise<{ isRinging: boolean, callState: string }>
+    async getCallStatus(): Promise<string>
     {
         try {
             const response = await this.request ({
@@ -595,13 +670,10 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             this.console.debug (`Call status: ${JSON.stringify (callData)}`);
 
             const callState = callData.CallStatus?.status || 'idle';
-            return {
-                isRinging: callState === 'ringing',
-                callState
-            };
+            return callState;
         } catch (e) {
-            this.console.debug(`Failed to get call status: ${e}`);
-            return { isRinging: false, callState: 'idle' };
+            this.console.error (`Failed to get call status: ${e}`);
+            return 'idle';
         }
     }
 
@@ -614,21 +686,24 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         }
         
         this.isCallPollingActive = true;
-        this.console.debug('Starting call status polling due to motion detection');
+        this.console.info ('Starting call status polling due to motion detection');
         
         this.callStatusInterval = setInterval(async () => {
             try {
-                const { callState } = await this.getCallStatus();
+                const callState = await this.getCallStatus();
                 
                 if (callState !== this.lastCallState) {
-                    this.console.debug(`Call state changed: ${this.lastCallState} -> ${callState}`);
+                    this.console.info (`Call state changed: ${this.lastCallState} -> ${callState}`);
                     
-                    if (callState === 'ringing' && this.lastCallState === 'idle') {
-                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkInvite);
+                    if (callState === 'ring') {
                         this.console.debug ('Doorbell ringing detected via polling');
-                    } else if (this.lastCallState === 'ringing' && callState === 'idle') {
-                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkHangup);
+                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkInvite);
+                    } else if (callState === 'idle') {
                         this.console.debug ('Doorbell hangup detected via polling');
+                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkHangup);
+                    } else if (callState === 'onCall') {
+                        this.console.debug ('Doorbell on call detected via polling');
+                        this.emitEvent ('event', HikvisionDoorbellEvent.TalkOnCall);
                     }
                     
                     this.lastCallState = callState;
@@ -749,13 +824,14 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
 
     /**
      * Get Access Control System events using polling method
-     * @param maxResults - Maximum number of results to return (default: 30)
+     * Returns events in reverse chronological order (newest first)
+     * @param maxResults - Maximum number of results to return (default: 20)
      * @param searchResultPosition - Starting position for search results (default: 0)
      * @param major - Major event type filter (0 = all, default: 0)
      * @param minor - Minor event type filter (0 = all, default: 0)
      */
     private async getAcsEvents (
-        maxResults: number = 30,
+        maxResults: number = 20,
         searchResultPosition: number = 0,
         major: number = 0,
         minor: number = 0
@@ -768,7 +844,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
                 maxResults,
                 major,
                 minor,
-                timeReverseOrder: false
+                timeReverseOrder: true
             }
         };
 
@@ -777,13 +853,19 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
                 url: `http://${this.endpoint}/ISAPI/AccessControl/AcsEvent?format=json`,
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded'
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
                 },
                 responseType: 'text',
             }, JSON.stringify (requestBody));
 
+            // Ensure successful response before attempting to parse JSON
+            if (response.statusCode !== 200) {
+                throw new Error(`HTTP ${response.statusCode}`);
+            }
+
             const eventData: AcsEventResponse = JSON.parse (response.body);
-            this.console.debug (`AcsEvent polling response: ${JSON.stringify (eventData, null, 2)}`);
+            // this.console.debug (`AcsEvent polling response: ${JSON.stringify (eventData, null, 2)}`);
             
             return eventData;
         } catch (error) {
@@ -818,8 +900,8 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             // Extract door number from event
             const doorNo = eventInfo.doorNo ? eventInfo.doorNo.toString() : '1';
             
+            this.console.info (`ACS polling event detected: ${HikvisionDoorbellEvent[doorbellEvent]} (${eventKey}) door=${doorNo}`);
             this.emitEvent ('event', doorbellEvent, doorNo);
-            this.console.debug (`ACS polling event detected: ${HikvisionDoorbellEvent[doorbellEvent]} (${eventKey}) door=${doorNo}`);
             
             // Start call polling when motion is detected
             if (doorbellEvent === HikvisionDoorbellEvent.Motion) {
@@ -842,7 +924,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             let latestEventTime: Date | undefined;
             
             if (eventResponse.AcsEvent && eventResponse.AcsEvent.InfoList) {
-                for (const eventInfo of eventResponse.AcsEvent.InfoList) {
+                for (const eventInfo of eventResponse.AcsEvent.InfoList.reverse()) {
                     const eventTime = new Date (eventInfo.time);
                     
                     // Filter events by time if lastEventTime is provided
@@ -902,6 +984,54 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             clearInterval (this.acsEventPollingInterval);
             this.acsEventPollingInterval = undefined;
             this.console.info ('ACS event polling stopped');
+        }
+    }
+
+    /**
+     * Check HTTP status code and XML response for errors
+     */
+    private async checkResponseStatus (response: any, operation: string): Promise<any>
+    {
+        // First check HTTP status code
+        let message: string | undefined;
+        if (response.statusCode && (response.statusCode < 200 || response.statusCode >= 300)) 
+        {
+            message = `${operation} failed with HTTP status ${response.statusCode}`;
+            this.console.error (message);
+        }
+
+        // Then check XML response body for error details
+        const body = response.body;
+        if (!body?.trim().startsWith ('<?xml')) {
+            return; // Not XML response, skip XML check
+        }
+
+        try {
+            const parsedXml = await xml2js.parseStringPromise (body);
+            const responseStatus = parsedXml.ResponseStatus;
+            
+            if (responseStatus) {
+                const statusCode = responseStatus.statusCode?.[0];
+                const statusString = responseStatus.statusString?.[0];
+                const errorMsg = responseStatus.errorMsg?.[0];
+                
+                if (statusCode && statusCode !== '1') { // Status code 1 means success
+                    const errorDetails = errorMsg || statusString || `Status code: ${statusCode}`;
+                    message = `${operation} failed: ${errorDetails}`;
+                    this.console.error (message);
+                }
+            }
+            if (message) {
+                throw new Error (message);
+            }
+            return parsedXml;
+        } catch (error) {
+            if (error.message.includes ('failed:')) {
+                throw error; // Re-throw our custom error
+            }
+            // If XML parsing fails, it might not be an error response, so continue
+            this.console.debug (`Failed to parse XML response for error checking: ${error.message}`);
+            return;
         }
     }
 }

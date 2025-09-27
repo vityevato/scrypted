@@ -91,7 +91,6 @@ export class SipManager {
     {
       const ring = this.state.msg;
 
-      let bye = true;
       let rs = this.makeRs (ring, 200, 'Ok');
 
       rs.content = this.fakeSdpContent();
@@ -122,7 +121,7 @@ export class SipManager {
          const doit = new Promise<boolean> (resolve => {
 
           sip.send (byeMsg, (rs) => {
-            console.debug (`BYE response:\n${sip.stringify (rs)}`);
+            this.console.info (`BYE response:\n${sip.stringify (rs)}`);
             if (rs.status == 200) {
               this.state.status = DialogStatus.HangupAc;
               resolve(true);
@@ -176,10 +175,10 @@ export class SipManager {
         await sip.start({
           logger: { 
             send: (message, addrInfo) => {  
-              console.debug(`send to ${addrInfo.address}:\n${sip.stringify(message)}`); 
+              this.console.info (`send to ${addrInfo.address}:\n${sip.stringify(message)}`); 
             },
             recv: (message, addrInfo) => {  
-              console.debug(`recv to ${addrInfo.address}:\n${sip.stringify(message)}`); 
+              this.console.info (`recv to ${addrInfo.address}:\n${sip.stringify(message)}`); 
             }
           },
           address: this.localIp,

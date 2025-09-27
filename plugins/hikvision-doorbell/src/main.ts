@@ -62,6 +62,9 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     private controlEvents: EventEmitter = new EventEmitter();
     private doorOpenDurationTimeout: NodeJS.Timeout;
     private debugController: DebugController;
+    
+    // intercom state protection
+    private intercomBusy: boolean = false;
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
@@ -155,17 +158,25 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                     motionPings = 0;
                 }, motionTimeoutDuration);
             }
-            else if (event === HikvisionDoorbellEvent.TalkInvite) 
+            else if (event === HikvisionDoorbellEvent.TalkInvite 
+                || event === HikvisionDoorbellEvent.TalkOnCall 
+                || event === HikvisionDoorbellEvent.TalkHangup) 
             {
-                this.binaryState = true;
-                setImmediate( () =>{
-                    this.controlEvents.emit (event.toString());
-                });
-            }
-            else if (event === HikvisionDoorbellEvent.TalkHangup) 
-            {
-                this.binaryState = false;
-                setImmediate( () =>{
+                const invite = (event === HikvisionDoorbellEvent.TalkInvite);
+                this.console.info (`Doorbell ${event.toString()} detected`);
+                if (this.intercomBusy && invite) 
+                {
+                    this.console.debug ('Doorbell is busy, starting hangUpCall');
+                    // Execute hangUpCall without blocking the event handler
+                    this.getClient().hangUpCall().catch(e => 
+                        this.console.error('Failed to hang up call:', e)
+                    );
+                    this.console.debug ('Doorbell is busy, ignore invite');
+                    return;
+                }
+
+                this.binaryState = invite;
+                setImmediate( () => {
                     this.controlEvents.emit (event.toString());
                 });
             }
@@ -184,13 +195,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                     clearTimeout (this.doorOpenDurationTimeout);
                     
                     if (isUnlock) {
-                        const timeout = (await this.getClient().getDoorOpenDuration (doorNo)) * 1000;
-                        this.doorOpenDurationTimeout = setTimeout ( async () => {
-                            lock.lockState = LockState.Locked;
-                            this.console.info (`Door ${doorNo} locked automatically after duration: ${timeout}ms`);
-                        }, timeout);
-                        
-                        setTimeout(() => this.stopRinging(), OPEN_LOCK_AUDIO_NOTIFY_DURASTION);
+                        setTimeout(() => this.stopRing(), OPEN_LOCK_AUDIO_NOTIFY_DURASTION);
                     }
                 } else {
                     this.console.warn (`Lock for door ${doorNo} not found`);
@@ -198,7 +203,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             }
             else if (
                 (event === HikvisionDoorbellEvent.DoorOpened 
-                || event === HikvisionDoorbellEvent.DoorClosed)
+                || event === HikvisionDoorbellEvent.DoorClosed
+            || event === HikvisionDoorbellEvent.DoorAbnormalOpened)
             ) 
             {
                 // Update specific entry sensor based on door state and doorNo
@@ -206,9 +212,10 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 const entrySensor = this.entrySensors.get (sensorNativeId);
                 
                 if (entrySensor) {
-                    const isOpen = event === HikvisionDoorbellEvent.DoorOpened;
+                    const isOpen = event !== HikvisionDoorbellEvent.DoorClosed;
+                    if (isOpen) { this.stopRing(); }
                     entrySensor.binaryState = isOpen;
-                    this.console.info (`Door ${doorNo} sensor: ${isOpen ? 'opened' : 'closed'}`);
+                    this.console.info (`Door ${doorNo} entry sensor: ${isOpen ? 'opened' : 'closed'}`);
                 } else {
                     this.console.warn (`Entry sensor for door ${doorNo} not found`);
                 }
@@ -590,82 +597,156 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     }
 
 
-    override async startIntercom(media: MediaObject): Promise<void> {
+    override async startIntercom(media: MediaObject): Promise<void> 
+    {
+        // Simple debounce protection
+        if (this.intercomBusy) {
+            this.console.debug ('Intercom busy, ignoring start request');
+            return;
+        }
 
-        await this.stopRinging();
+        this.intercomBusy = true;
+        this.console.debug ('Starting intercom');
         
-        const channel = this.getRtspChannel() || '1';
-        let codec: string;
-        let format: string;
+        let channel: string = '1';
+        let sessionId: string | undefined;
+        
+        try 
+        {
 
-        try {
-            codec = await this.getClient().twoWayAudioCodec(channel);
-        }
-        catch (e) {
-            this.console.error('Failure while determining two way audio codec', e);
-        }
+            channel = this.getRtspChannel() || '1';
 
-        if (codec === 'G.711ulaw') {
-            codec = 'pcm_mulaw';
-            format = 'mulaw'
-        }
-        else if (codec === 'G.711alaw') {
-            codec = 'pcm_alaw';
-            format = 'alaw'
-        }
-        else {
-            if (codec) {
-                this.console.warn('Unknown codec', codec);
-                this.console.warn('Set your audio codec to G.711ulaw.');
+            let codec: string;
+            let format: string;
+
+            try {
+                codec = await this.getClient().twoWayAudioCodec(channel);
             }
-            this.console.warn('Using fallback codec pcm_mulaw. This may not be correct.');
-            // seems to ship with this as defaults.
-            codec = 'pcm_mulaw';
-            format = 'mulaw'
-        }
+            catch (e) {
+                this.console.error('Failure while determining two way audio codec', e);
+            }
 
-        const buffer = await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput);
-        const ffmpegInput = JSON.parse(buffer.toString()) as FFmpegInput;
+            if (codec === 'G.711ulaw') {
+                codec = 'pcm_mulaw';
+                format = 'mulaw'
+            }
+            else if (codec === 'G.711alaw') {
+                codec = 'pcm_alaw';
+                format = 'alaw'
+            }
+            else {
+                if (codec) {
+                    this.console.warn('Unknown codec', codec);
+                    this.console.warn('Set your audio codec to G.711ulaw.');
+                }
+                this.console.warn('Using fallback codec pcm_mulaw. This may not be correct.');
+                // seems to ship with this as defaults.
+                codec = 'pcm_mulaw';
+                format = 'mulaw'
+            }
 
-        const passthrough = new PassThrough();
-        const put = this.getClient().openTwoWayAudio(channel, passthrough);
+            const buffer = await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput);
+            const ffmpegInput = JSON.parse(buffer.toString()) as FFmpegInput;
 
-        let available = Buffer.alloc(0);
-        this.activeIntercom?.kill();
-        const forwarder = this.activeIntercom = await startRtpForwarderProcess(this.console, ffmpegInput, {
-            audio: {
-                onRtp: rtp => {
-                    const parsed = RtpPacket.deSerialize(rtp);
-                    available = Buffer.concat([available, parsed.payload]);
-                    if (available.length > 1024) {
-                        const data = available.subarray(0, 1024);
-                        passthrough.push(data);
-                        available = available.subarray(1024);
+            const passthrough = new PassThrough();
+            const { sessionId: sid, result: put } = await this.getClient().openTwoWayAudio(channel, passthrough);
+            sessionId = sid;
+
+            let available = Buffer.alloc(0);
+            
+            // Kill previous forwarder if exists
+            if (this.activeIntercom && !this.activeIntercom.killed) {
+                this.activeIntercom.kill();
+            }
+            
+            const forwarder = this.activeIntercom = await startRtpForwarderProcess(this.console, ffmpegInput, {
+                audio: {
+                    onRtp: rtp => {
+                        const parsed = RtpPacket.deSerialize(rtp);
+                        available = Buffer.concat([available, parsed.payload]);
+                        if (available.length > 1024) {
+                            const data = available.subarray(0, 1024);
+                            passthrough.push(data);
+                            available = available.subarray(1024);
+                        }
+                    },
+                    codecCopy: codec,
+                    encoderArguments: [
+                        '-ar', '8000',
+                        '-ac', '1',
+                        '-acodec', codec,
+                    ]
+                }
+            });
+
+            // Single cleanup
+            forwarder.killPromise.finally(() => {
+                this.console.debug ('Audio finished, cleaning up');
+                try {
+                    passthrough.end();
+                    this.getClient().closeTwoWayAudio(channel, sessionId);
+                } catch (e) {
+                    // Ignore if already ended
+                }
+                
+                // Reset state without calling stopIntercom recursively
+                this.activeIntercom = undefined;
+                this.intercomBusy = false;
+            });
+            
+            put.finally(() => {
+                if (forwarder && !forwarder.killed) {
+                    this.console.debug ('Put finished, cleaning up');
+                    forwarder.kill();
+                }
+            });
+            
+            // the put request will be open until the passthrough is closed.
+            put.then(response => {
+                if (response.statusCode !== 200 && forwarder && !forwarder.killed) {
+                    this.console.debug ('Put finished with non-200 status code, cleaning up');
+                    forwarder.kill();
+                }
+            })
+                .catch(() => {
+                    if (forwarder && !forwarder.killed) {
+                        this.console.debug ('Put finished with error, cleaning up');
+                        forwarder.kill();
                     }
-                },
-                codecCopy: codec,
-                encoderArguments: [
-                    '-ar', '8000',
-                    '-ac', '1',
-                    '-acodec', codec,
-                ]
-            }
-        });
+                });
 
-        forwarder.killPromise.finally(() => {
-            console.debug('audio finished');
-            passthrough.end();
-            this.stopIntercom();
-        });
-        
-        put.finally(() => forwarder.kill());
+            await this.stopRing();
+            
+        } catch (error) {
+            // Reset state on error
+            await this.getClient().closeTwoWayAudio(channel, sessionId);
+            this.intercomBusy = false;
+            throw error;
+        }
     }
 
-    override async stopIntercom(): Promise<void> {
-        this.activeIntercom?.kill();
-        this.activeIntercom = undefined;
+    override async stopIntercom(): Promise<void> 
+    {
+        if (!this.intercomBusy) {
+            this.console.debug ('Intercom not active, ignoring stop request');
+            return;
+        }
 
-        await this.getClient().closeTwoWayAudio(this.getRtspChannel() || '1');
+        this.console.debug ('Stopping intercom');
+        
+        try 
+        {
+            // Kill the forwarder if exists
+            if (this.activeIntercom && !this.activeIntercom.killed) {
+                this.activeIntercom.kill();
+            }
+            this.activeIntercom = undefined;
+
+            await this.getClient().hangUpCall();
+        } finally {
+            // Always reset state
+            this.intercomBusy = false;
+        }
     }
 
     private getEventApi()
@@ -679,7 +760,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             this.storage);
     }
 
-    private async stopRinging ()
+    private async stopRing()
     {
         if (!this.binaryState) return;
 
@@ -694,7 +775,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             }
         }
         else {
-            await this.getClient().stopRinging();
+            await this.getClient().hangUpCall(); 
         }
     }
 
