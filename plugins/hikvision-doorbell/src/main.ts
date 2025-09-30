@@ -38,8 +38,9 @@ const DEFAULT_PROXY_PHONE: string = '10102';
 const DEFAULT_DOORBELL_PHONE: string = '10101';
 const DEFAULT_BUTTON_NUMBER: string = '1';
 
-const OPEN_LOCK_AUDIO_NOTIFY_DURASTION: number = 3000  // mSeconds
-const UNREACHED_REPEAT_TIMEOUT: number = 10000  // mSeconds
+const LOCK_AUDIO_NOTIFY_SEC: number = 3  // Duration to play audio notification after door unlock
+const UNREACHED_RETRY_SEC: number = 10  // Retry timeout when device is unreachable
+const CANCEL_CALL_DELAY_SEC: number = 3  // Delay before killing active intercom after cancelCall
 
 function channelToCameraNumber(channel: string) {
     if (!channel)
@@ -65,6 +66,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     
     // intercom state protection
     private intercomBusy: boolean = false;
+    private stopIntercomQueue: Promise<void> = Promise.resolve();
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
@@ -166,11 +168,9 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 this.console.info (`Doorbell ${event.toString()} detected`);
                 if (this.intercomBusy && invite) 
                 {
-                    this.console.debug ('Doorbell is busy, starting hangUpCall');
-                    // Execute hangUpCall without blocking the event handler
-                    this.getClient().hangUpCall().catch(e => 
-                        this.console.error('Failed to hang up call:', e)
-                    );
+                    this.console.debug ('Doorbell is busy, starting cancelCall');
+                    // Execute cancelCall without blocking the event handler
+                    this.cancelCall();
                     this.console.debug ('Doorbell is busy, ignore invite');
                     return;
                 }
@@ -195,7 +195,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                     clearTimeout (this.doorOpenDurationTimeout);
                     
                     if (isUnlock) {
-                        setTimeout(() => this.stopRing(), OPEN_LOCK_AUDIO_NOTIFY_DURASTION);
+                        setTimeout(() => this.stopRing(), LOCK_AUDIO_NOTIFY_SEC * 1000);
                     }
                 } else {
                     this.console.warn (`Lock for door ${doorNo} not found`);
@@ -223,6 +223,22 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         })
 
         return events;
+    }
+
+    private async cancelCall(): Promise<void>
+    {
+        try
+        {
+            await this.getClient().cancelCall();
+            // Wait before killing the active intercom
+            await new Promise (resolve => setTimeout (resolve, CANCEL_CALL_DELAY_SEC * 1000));
+            this.activeIntercom?.kill();
+            this.console.debug ('Stopped intercom by kill activeIntercom');
+        }
+        catch (e)
+        {
+            this.console.error ('Failed to cancel call:', e);
+        }
     }
 
     override createClient() {
@@ -727,26 +743,36 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
 
     override async stopIntercom(): Promise<void> 
     {
-        if (!this.intercomBusy) {
-            this.console.debug ('Intercom not active, ignoring stop request');
-            return;
-        }
-
-        this.console.debug ('Stopping intercom');
-        
-        try 
-        {
-            // Kill the forwarder if exists
-            if (this.activeIntercom && !this.activeIntercom.killed) {
-                this.activeIntercom.kill();
+        // Queue stopIntercom calls to ensure sequential execution
+        const stopPromise = this.stopIntercomQueue.then (async () => {
+            if (!this.intercomBusy) {
+                this.console.debug ('Intercom not active, ignoring stop request');
+                return;
             }
-            this.activeIntercom = undefined;
 
-            await this.getClient().hangUpCall();
-        } finally {
-            // Always reset state
-            this.intercomBusy = false;
-        }
+            this.console.debug ('Stopping intercom');
+            
+            try 
+            {
+                // Kill the forwarder if exists
+                if (this.activeIntercom && !this.activeIntercom.killed) {
+                    this.activeIntercom.kill();
+                }
+                this.activeIntercom = undefined;
+
+                await this.getClient().hangUpCall();
+            } finally {
+                // Always reset state
+                this.intercomBusy = false;
+            }
+        });
+
+        // Update queue to continue after this request (success or failure)
+        this.stopIntercomQueue = stopPromise.catch (() => {
+            // Swallow errors in the queue chain to prevent blocking subsequent calls
+        });
+
+        return stopPromise;
     }
 
     private getEventApi()
@@ -801,7 +827,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             } catch (e) {
                 this.console.error (`Error installing fake SIP settings: ${e}`);
                 // repeat if unreached
-                this.installSipSettingsOnDeviceTimeout = setTimeout (() => this.installSipSettingsOnDevice(), UNREACHED_REPEAT_TIMEOUT);
+                this.installSipSettingsOnDeviceTimeout = setTimeout (() => this.installSipSettingsOnDevice(), UNREACHED_RETRY_SEC * 1000);
             }
         }
     }

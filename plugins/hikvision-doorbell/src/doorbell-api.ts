@@ -47,9 +47,7 @@ interface AcsEventResponse {
 } 
 
 const maxEventAgeSeconds = 30; // Ignore events older than this many seconds
-const callPollingTimeoutSec = 3 * 60; // Auto-stop call status polling after 3 minutes
 const callPollingIntervalSec = 1; // Call status polling interval in seconds
-const acsPollingIntervalSec = 1.3; // ACS event polling interval in seconds, must be greater than 1 second
 
 const EventCodeMap = new Map<string, HikvisionDoorbellEvent>([
     ['5,25', HikvisionDoorbellEvent.DoorOpened],
@@ -93,6 +91,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     private eventServer?: Server;
     private listener?: Destroyable;
     private requestQueue: Promise<any> = Promise.resolve();
+    private alertStream?: Readable;
     
     // Door control capabilities
     private doorMinNo: number = 1;
@@ -116,8 +115,8 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     {
         this.listener?.destroy();
         this.eventServer?.close();
+        this.stopAlertStream();
         this.stopCallStatusPolling();
-        this.stopAcsEventPolling();
     }
 
     override async request (urlOrOptions: string | HttpFetchOptions<Readable>, body?: AuthRequestBody)
@@ -209,12 +208,16 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
                 this.console.warn (`Failed to load device timezone, using UTC fallback: ${error}`);
             }
     
-            this.startAcsEventPolling();
-            this.console.info ('Using ACS event polling for events');
-    
+            await this.listenAlertStream();
+            this.console.info ('Using alert stream for events');
+
+            this.startCallStatusPolling();
+            this.console.info ('Call status polling started');
+
             this.listener = new HikvisionDoorbell_Destroyable (() => {
                 this.listener = undefined;
-                this.stopAcsEventPolling();
+                this.stopAlertStream();
+                this.stopCallStatusPolling();
             });
         }
     
@@ -507,6 +510,18 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         return resp;
     }
 
+    async cancelCall()
+    {
+        this.console.debug ('(cancelCall) Starting cancel request');
+        const resp = await this.request({
+            url: `http://${this.endpoint}/ISAPI/VideoIntercom/callSignal?format=json`,
+            method: 'PUT',
+            responseType: 'text',
+        }, '{"CallSignal":{"cmdType":"cancel"}}');
+        this.console.debug (`(cancelCall) Cancel return: ${resp.statusCode} - ${resp.body}`);
+        return resp;
+    }
+
     async rejectCall()
     {
         const resp = await this.request({
@@ -646,7 +661,6 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
 
 
     private callStatusInterval?: NodeJS.Timeout;
-    private callStatusStopTimeout?: NodeJS.Timeout;
     private lastCallState: string = 'idle';
     private isCallPollingActive: boolean = false;
     
@@ -680,13 +694,12 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     private startCallStatusPolling()
     {
         if (this.callStatusInterval || this.isCallPollingActive) {
-            // If already active, just reset the timeout
-            this.resetCallStatusPollingTimeout();
+            this.console.debug ('Call status polling is already active');
             return;
         }
         
         this.isCallPollingActive = true;
-        this.console.info ('Starting call status polling due to motion detection');
+        this.console.info ('Starting call status polling');
         
         this.callStatusInterval = setInterval(async () => {
             try {
@@ -712,33 +725,15 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
                 this.console.warn (`Call status polling error: ${e}`);
             }
         }, callPollingIntervalSec * 1000);
-
-        this.resetCallStatusPollingTimeout();
     }
     
-    private resetCallStatusPollingTimeout()
-    {
-        // Clear existing timeout
-        if (this.callStatusStopTimeout) {
-            clearTimeout (this.callStatusStopTimeout);
-        }
-        
-        // Set new timeout
-        this.callStatusStopTimeout = setTimeout(() => {
-            this.stopCallStatusPolling();
-            this.console.debug (`Call status polling stopped automatically after ${callPollingTimeoutSec} seconds of no motion`);
-        }, callPollingTimeoutSec * 1000);
-    }
 
     private stopCallStatusPolling()
     {
         if (this.callStatusInterval) {
             clearInterval (this.callStatusInterval);
             this.callStatusInterval = undefined;
-        }
-        if (this.callStatusStopTimeout) {
-            clearTimeout (this.callStatusStopTimeout);
-            this.callStatusStopTimeout = undefined;
+            this.console.info ('Call status polling stopped');
         }
         this.isCallPollingActive = false;
     }
@@ -902,11 +897,6 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             
             this.console.info (`ACS polling event detected: ${HikvisionDoorbellEvent[doorbellEvent]} (${eventKey}) door=${doorNo}`);
             this.emitEvent ('event', doorbellEvent, doorNo);
-            
-            // Start call polling when motion is detected
-            if (doorbellEvent === HikvisionDoorbellEvent.Motion) {
-                this.startCallStatusPolling();
-            }
         } else {
             this.console.info (`Unknown ACS event: major=${eventInfo.major}, minor=${eventInfo.minor}`);
         }
@@ -954,40 +944,6 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     }
     
     /**
-     * Start periodic ACS event polling
-     * Polls for new events using the stored last event time
-     */
-    private startAcsEventPolling(): void
-    {
-        if (this.acsEventPollingInterval) {
-            this.console.debug ('ACS event polling is already active');
-            return;
-        }
-        
-        this.console.info (`Starting ACS event polling (every ${acsPollingIntervalSec} seconds)`);
-        
-        this.acsEventPollingInterval = setInterval (async () => {
-            try {
-                await this.pollAndProcessAcsEvents (this.lastAcsEventTime);
-            } catch (error) {
-                this.console.warn (`ACS event polling error: ${error}`);
-            }
-        }, acsPollingIntervalSec * 1000);
-    }
-    
-    /**
-     * Stop ACS event polling
-     */
-    private stopAcsEventPolling(): void
-    {
-        if (this.acsEventPollingInterval) {
-            clearInterval (this.acsEventPollingInterval);
-            this.acsEventPollingInterval = undefined;
-            this.console.info ('ACS event polling stopped');
-        }
-    }
-
-    /**
      * Check HTTP status code and XML response for errors
      */
     private async checkResponseStatus (response: any, operation: string): Promise<any>
@@ -1033,5 +989,119 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             this.console.debug (`Failed to parse XML response for error checking: ${error.message}`);
             return;
         }
+    }
+
+    /**
+     * Listen for alert stream events
+     * This method can be called to start listening for events
+     */
+    async listenAlertStream()
+    {
+        try {
+            this.stopAlertStream();
+
+            const { body } = await this.request({
+                url: `http://${this.endpoint}/ISAPI/Event/notification/alertStream`,
+                responseType: 'readable',
+                headers: {
+                    'Accept': '*/*'
+                }
+            });
+    
+            const readable = body as Readable;
+            let buffer = '';
+
+            this.alertStream = readable;
+
+            readable.on ('data', (chunk: Buffer) => {
+                buffer += chunk.toString ('utf8');
+                
+                // Parse multipart boundary content
+                const parts = buffer.split ('--MIME_boundary');
+                buffer = parts.pop() || ''; // Keep incomplete part
+                
+                for (const part of parts) {
+                    if (!part.trim()) continue;
+                    
+                    // Extract JSON from multipart section
+                    const jsonMatch = part.match(/Content-Type: application\/json[^{]*(\{.*\})/s);
+                    if (jsonMatch) {
+                        try {
+                            const eventData = JSON.parse (jsonMatch[1]);
+                            this.processAlertStreamEvent (eventData);
+                        } catch (pe) {
+                            this.console.warn(`Failed to parse alertStream JSON: ${pe}`);
+                        }
+                    }
+                }
+            });
+    
+            readable.on ('error', (err) => {
+                if (this.alertStream === readable) {
+                    this.alertStream = undefined;
+                }
+                this.console.error (`alertStream error: ${err}`);
+                this.emitEvent ('error', err);
+            });
+    
+            readable.on ('close', () => {
+                if (this.alertStream === readable) {
+                    this.alertStream = undefined;
+                }
+                this.console.debug ('alertStream closed');
+                this.emitEvent ('close');
+            });
+    
+        } catch (err) {
+            this.console.error (`listenAlertStream failed: ${err}`);
+            throw err;
+        }
+    }
+
+    /**
+     * Stop alert stream listener
+     */
+    private stopAlertStream(): void
+    {
+        if (!this.alertStream) {
+            return;
+        }
+
+        this.console.debug ('Stopping alert stream listener');
+        const stream = this.alertStream;
+        this.alertStream = undefined;
+        stream.removeAllListeners();
+        if (!stream.destroyed) {
+            stream.destroy();
+        }
+    }
+
+    processAlertStreamEvent (eventData: any)
+    {
+        const eventType = eventData.eventType || '';
+    
+        this.console.debug (`AlertStream event: ${eventType}`);
+
+        // Check if event is too old (ignore events older than 30 seconds)
+        if (eventData.dateTime) {
+            const eventTime = new Date (eventData.dateTime);
+            const now = new Date();
+            const ageInSeconds = (now.getTime() - eventTime.getTime()) / 1000;
+            
+            if (ageInSeconds > maxEventAgeSeconds) {
+                this.console.debug (`Ignoring old event: ${ageInSeconds.toFixed (1)}s old`);
+                return;
+            }
+        }
+    
+        // Map JSON events to existing HikvisionDoorbellEvent enum
+        if (eventType === 'videoloss') {
+            // Video loss events - not typically used for doorbell
+            return;
+        }
+
+        this.console.debug (`AlertStream JSON: ${JSON.stringify (eventData, null, 2)}`);
+    
+        this.pollAndProcessAcsEvents (this.lastAcsEventTime);
     }
 }
