@@ -5,7 +5,7 @@ import { RtpPacket } from '../../../external/werift/packages/rtp/src/rtp/rtp';
 import { createRtspMediaStreamOptions, RtspProvider, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
 import { startRtpForwarderProcess } from '../../webrtc/src/rtp-forwarders';
 import { HikvisionDoorbellAPI, HikvisionDoorbellEvent } from "./doorbell-api";
-import { SipManager, SipRegistration } from "./sip-manager";
+import { SipManager, SipRegistration, SipAudioTarget } from "./sip-manager";
 import { parseBooleans, parseNumbers } from "xml2js/lib/processors";
 import { once, EventEmitter } from 'node:events';
 import { timeoutPromise } from "@scrypted/common/src/promise-utils";
@@ -120,6 +120,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                         break;
                 }
             }
+
+            this.updateInviteHandler();
         })();
     }
 
@@ -132,8 +134,6 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         let motionTimeout: NodeJS.Timeout;
         const api = this.getEventApi();
         const events = await api.listenEvents();
-
-        let ignoreCameraNumber: boolean;
 
         let motionPingsNeeded = parseInt(this.storage.getItem('motionPings')) || 1;
         const motionTimeoutDuration = (parseInt(this.storage.getItem('motionTimeout')) || 10) * 1000;
@@ -229,7 +229,12 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     {
         try
         {
-            await this.getClient().cancelCall();
+            if (this.sipManager) {
+                await this.sipManager.answer();
+            }
+            else {
+                await this.getClient().cancelCall();
+            }
             // Wait before killing the active intercom
             await new Promise (resolve => setTimeout (resolve, CANCEL_CALL_DELAY_SEC * 1000));
             this.activeIntercom?.kill();
@@ -241,8 +246,34 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         }
     }
 
+    private createSipAudioTrack (target: SipAudioTarget, codec: string)
+    {
+        return {
+            onRtp: (rtp: Buffer) => {
+                // RTP packets sent directly by ffmpeg to target
+                this.console.debug (`RTP packet sent to ${target.ip}:${target.port}`);
+            },
+            codecCopy: codec,
+            encoderArguments: [
+                '-ar', '8000',
+                '-ac', '1',
+                '-acodec', codec,
+                '-f', 'rtp',
+                `rtp://${target.ip}:${target.port}`,
+            ]
+        };
+    }
+
     override createClient() {
-        return new HikvisionDoorbellAPI(this.getIPAddress(), this.getHttpPort(), this.getUsername(), this.getPassword(), this.console, this.storage);
+        return new HikvisionDoorbellAPI(
+            this.getIPAddress(), 
+            this.getHttpPort(), 
+            this.getUsername(), 
+            this.getPassword(), 
+            this.isCallPolling(),
+            this.console, 
+            this.storage
+        );
     }
 
     override getClient(): HikvisionDoorbellAPI {
@@ -626,10 +657,12 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         
         let channel: string = '1';
         let sessionId: string | undefined;
+        let sipAudioTarget: SipAudioTarget | undefined;
         
         try 
         {
-
+            await this.stopRing();
+            
             channel = this.getRtspChannel() || '1';
 
             let codec: string;
@@ -664,26 +697,42 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             const buffer = await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput);
             const ffmpegInput = JSON.parse(buffer.toString()) as FFmpegInput;
 
-            const passthrough = new PassThrough();
-            const { sessionId: sid, result: put } = await this.getClient().openTwoWayAudio(channel, passthrough);
-            sessionId = sid;
-
-            let available = Buffer.alloc(0);
+            // Check if we have SIP audio target
+            sipAudioTarget = this.sipManager?.remoteAudioTarget;
             
+            let passthrough: PassThrough | undefined;
+            let put: Promise<any> | undefined;
+            
+            if (!sipAudioTarget) {
+                // Use HTTP method
+                passthrough = new PassThrough();
+                const result = await this.getClient().openTwoWayAudio(channel, passthrough);
+                sessionId = result.sessionId;
+                put = result.result;
+            } else {
+                this.console.info (`Using SIP RTP target: ${sipAudioTarget.ip}:${sipAudioTarget.port}`);
+            }
+
             // Kill previous forwarder if exists
             if (this.activeIntercom && !this.activeIntercom.killed) {
                 this.activeIntercom.kill();
             }
             
-            const forwarder = this.activeIntercom = await startRtpForwarderProcess(this.console, ffmpegInput, {
-                audio: {
-                    onRtp: rtp => {
-                        const parsed = RtpPacket.deSerialize(rtp);
-                        available = Buffer.concat([available, parsed.payload]);
+            // Configure audio track based on mode (SIP or HTTP)
+            let audioTrack;
+            if (sipAudioTarget) {
+                audioTrack = this.createSipAudioTrack (sipAudioTarget, codec);
+            } else {
+                // HTTP mode needs buffer accumulation
+                let available = Buffer.alloc(0);
+                audioTrack = {
+                    onRtp: (rtp: Buffer) => {
+                        const parsed = RtpPacket.deSerialize (rtp);
+                        available = Buffer.concat ([available, parsed.payload]);
                         if (available.length > 1024) {
-                            const data = available.subarray(0, 1024);
-                            passthrough.push(data);
-                            available = available.subarray(1024);
+                            const data = available.subarray (0, 1024);
+                            passthrough!.push (data);
+                            available = available.subarray (1024);
                         }
                     },
                     codecCopy: codec,
@@ -692,15 +741,25 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                         '-ac', '1',
                         '-acodec', codec,
                     ]
-                }
-            });
+                };
+            }
+
+            const forwarder = this.activeIntercom = await startRtpForwarderProcess (
+                this.console, 
+                ffmpegInput, 
+                { audio: audioTrack }
+            );
 
             // Single cleanup
             forwarder.killPromise.finally(() => {
                 this.console.debug ('Audio finished, cleaning up');
                 try {
-                    passthrough.end();
-                    this.getClient().closeTwoWayAudio(channel, sessionId);
+                    if (passthrough) {
+                        passthrough.end();
+                    }
+                    if (!sipAudioTarget) {
+                        this.getClient().closeTwoWayAudio(channel, sessionId);
+                    }
                 } catch (e) {
                     // Ignore if already ended
                 }
@@ -710,32 +769,33 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 this.intercomBusy = false;
             });
             
-            put.finally(() => {
-                if (forwarder && !forwarder.killed) {
-                    this.console.debug ('Put finished, cleaning up');
-                    forwarder.kill();
-                }
-            });
-            
-            // the put request will be open until the passthrough is closed.
-            put.then(response => {
-                if (response.statusCode !== 200 && forwarder && !forwarder.killed) {
-                    this.console.debug ('Put finished with non-200 status code, cleaning up');
-                    forwarder.kill();
-                }
-            })
-                .catch(() => {
+            if (put) {
+                put.finally(() => {
                     if (forwarder && !forwarder.killed) {
-                        this.console.debug ('Put finished with error, cleaning up');
+                        this.console.debug ('Put finished, cleaning up');
                         forwarder.kill();
                     }
                 });
-
-            await this.stopRing();
-            
+                
+                // the put request will be open until the passthrough is closed.
+                put.then(response => {
+                    if (response.statusCode !== 200 && forwarder && !forwarder.killed) {
+                        this.console.debug ('Put finished with non-200 status code, cleaning up');
+                        forwarder.kill();
+                    }
+                })
+                    .catch(() => {
+                        if (forwarder && !forwarder.killed) {
+                            this.console.debug ('Put finished with error, cleaning up');
+                            forwarder.kill();
+                        }
+                    });
+            }
         } catch (error) {
             // Reset state on error
-            await this.getClient().closeTwoWayAudio(channel, sessionId);
+            if (!sipAudioTarget) {
+                await this.getClient().closeTwoWayAudio(channel, sessionId);
+            }
             this.intercomBusy = false;
             throw error;
         }
@@ -782,6 +842,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             this.getHttpPort(), 
             this.getUsername(), 
             this.getPassword(), 
+            this.isCallPolling(),
             this.console,
             this.storage);
     }
@@ -792,10 +853,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
 
         if (this.sipManager)
         {
-            try 
-            {
-                const hup = timeoutPromise (5000, once (this.controlEvents, HikvisionDoorbellEvent.TalkHangup.toString()));
-                await Promise.all ([hup, this.sipManager.answer()])
+            try {
+                await this.sipManager.answer();
             } catch (error) {
                 this.console.error (`Stop SIP ringing error: ${error}`);
             }
@@ -971,6 +1030,43 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             callId: this.storage.getItem (SIP_CLIENT_CALLID_KEY) || ''
           }
     }
+
+    private updateInviteHandler()
+    {
+        const sipMode = this.getSipMode();
+        
+        if (sipMode !== SipMode.Off && this.sipManager)
+        {
+            // Use SIP for invite detection
+            this.console.debug ('Using SIP for invite detection');
+            
+            this.sipManager.setOnInviteHandler ((audioTarget) => {
+                this.console.debug (`SIP INVITE received, audio target: ${audioTarget?.ip}:${audioTarget?.port}`);
+                if (this.activeIntercom) 
+                {
+                    this.console.debug ('(SIP) Doorbell is busy, starting cancelCall');
+                    // Execute cancelCall without blocking the event handler
+                    this.cancelCall();
+                    this.console.debug ('(SIP) Doorbell is busy, ignore invite');
+                    return;
+                }
+                this.binaryState = true;
+            });
+
+            this.sipManager.setOnHangupHandler (() => {
+                this.console.debug ('SIP BYE received');
+                this.binaryState = false;
+            });
+
+            return;
+        }
+        // Use polling for invite detection
+        this.console.debug ('Using call status polling for invite detection');
+    }
+
+    private isCallPolling(): boolean {
+        return this.getSipMode() === SipMode.Off;
+    }
 }
 
 export class HikvisionDoorbellProvider extends RtspProvider
@@ -995,7 +1091,14 @@ export class HikvisionDoorbellProvider extends RtspProvider
         ];
     }
 
-    createSharedClient (ip: string, port: string, username: string, password: string, console: Console, storage: Storage) 
+    createSharedClient (
+        ip: string, 
+        port: string, 
+        username: string, 
+        password: string,
+        callStatusPolling: boolean,
+        console: Console, 
+        storage: Storage) 
     {
         if (!this.clients)
             this.clients = new Map();
@@ -1005,7 +1108,7 @@ export class HikvisionDoorbellProvider extends RtspProvider
         if (check) 
             return check;
         
-        const client = new HikvisionDoorbellAPI (ip, port, username, password, console, storage);
+        const client = new HikvisionDoorbellAPI (ip, port, username, password, callStatusPolling, console, storage);
         this.clients.set (key, client);
         return client;
     }
@@ -1022,7 +1125,15 @@ export class HikvisionDoorbellProvider extends RtspProvider
         const skipValidate = settings.skipValidate?.toString() === 'true';
         let twoWayAudio: string;
         if (!skipValidate) {
-            const api = new HikvisionDoorbellAPI(`${settings.ip}`, `${settings.httpPort || '80'}`, username, password, this.console, this.storage);
+            const api = new HikvisionDoorbellAPI(
+                `${settings.ip}`, 
+                `${settings.httpPort || '80'}`,
+                 username, 
+                 password, 
+                 false,
+                 this.console, 
+                 this.storage
+                );
             try {
                 const deviceInfo = await api.getDeviceInfo();
 

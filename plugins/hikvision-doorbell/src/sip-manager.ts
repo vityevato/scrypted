@@ -4,8 +4,12 @@ import { localServiceIpAddress, rString, udpSocketType, unq } from './utils';
 import { isV4Format } from 'ip';
 import dgram from 'node:dgram';
 import { timeoutPromise } from "@scrypted/common/src/promise-utils";
+import { parseSdp } from '@scrypted/common/src/sdp-utils';
 
-
+export interface SipAudioTarget {
+    ip: string;
+    port: number;
+}
 
 enum DialogStatus 
 {
@@ -42,8 +46,53 @@ export class SipManager {
 
   localIp: string;
   localPort: number;
+  private onInviteHandler?: (audioTarget?: SipAudioTarget) => void;
+  private onHangupHandler?: () => void;
+  remoteAudioTarget?: SipAudioTarget;
 
   constructor(private ip: string, private console: Console, private storage: Storage) {
+  }
+
+  setOnInviteHandler (handler: (audioTarget?: SipAudioTarget) => void)
+  {
+    this.onInviteHandler = handler;
+  }
+
+  setOnHangupHandler (handler: () => void)
+  {
+    this.onHangupHandler = handler;
+  }
+
+  private parseSdpAudioTarget (sdpContent?: string): SipAudioTarget | undefined
+  {
+    if (!sdpContent) return undefined;
+
+    try {
+      const parsed = parseSdp (sdpContent);
+      
+      // Find audio section
+      const audioSection = parsed.msections.find (s => s.type === 'audio');
+      if (!audioSection) {
+        this.console.warn ('No audio section found in SDP');
+        return undefined;
+      }
+
+      // Extract IP from header (c=IN IP4 ...)
+      const cLine = parsed.header.lines.find (l => l.startsWith ('c='));
+      const ipMatch = cLine?.match (/c=IN IP[46] ([\d.:a-fA-F]+)/);
+      const ip = ipMatch?.[1];
+
+      const port = audioSection.port;
+
+      if (ip && port) {
+        this.console.debug (`Parsed SDP audio target: ${ip}:${port}`);
+        return { ip, port };
+      }
+    } catch (e) {
+      this.console.error (`Failed to parse SDP: ${e}`);
+    }
+
+    return undefined;
   }
 
   async startClient (creds: SipRegistration)
@@ -114,6 +163,9 @@ export class SipManager {
         status: DialogStatus.AnswerAc,
         msg: ring
       }
+      
+      return;
+
       const byeMsg = this.bye (ring);
 
       try 
@@ -139,6 +191,15 @@ export class SipManager {
       // const result = await Promise.race ([waitOk, awaitTimeout(waitResponseTimeout).then (()=> false)])
       if (!result) {
         this.console.error (`When BYE, timeut occurred`);
+      }
+
+      if (this.onHangupHandler) 
+      {
+        try {
+          this.onHangupHandler();
+        } catch (e) {
+          this.console.error (`Error in onHangup handler: ${e}`);
+        }
       }
 
       this.clearState();
@@ -245,6 +306,9 @@ export class SipManager {
   { 
     if (this.state.status === DialogStatus.Idle)
     {
+      // Parse SDP to extract audio target
+      this.remoteAudioTarget = this.parseSdpAudioTarget (rq.content);
+      
       rq.headers.to = {uri: rq.headers.to.uri, params: { tag: 'govno' }};
       this.state = {
         status: DialogStatus.Ringing,
@@ -252,6 +316,16 @@ export class SipManager {
       }
       let rs = this.makeRs(rq, 180, 'Ringing');
       sip.send(rs);
+
+      // Notify external handler if registered
+      if (this.onInviteHandler) {
+        try {
+          this.onInviteHandler (this.remoteAudioTarget);
+        } catch (e) {
+          this.console.error (`Error in onInvite handler: ${e}`);
+        }
+      }
+
       return true;
     }
     return false;
@@ -309,7 +383,10 @@ export class SipManager {
     't=0 0\r\n' +
     'm=audio 9654 RTP/AVP 0 101\r\n' +
     'a=rtpmap:0 PCMU/8000\r\n' +
-    'a=rtpmap:101 telephone-event/8000\r\n';
+    'a=rtpmap:101 telephone-event/8000\r\n' +
+    'a=sendonly\r\n' +
+    'm=video 0 RTP/AVP 96\r\n' +
+    'a=inactive\r\n';
   }
 
   private bye (rq: any): any

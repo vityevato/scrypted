@@ -48,6 +48,7 @@ interface AcsEventResponse {
 
 const maxEventAgeSeconds = 30; // Ignore events older than this many seconds
 const callPollingIntervalSec = 1; // Call status polling interval in seconds
+const alertTickTimeoutSec = 60; // Alert stream tick timeout in seconds
 
 const EventCodeMap = new Map<string, HikvisionDoorbellEvent>([
     ['5,25', HikvisionDoorbellEvent.DoorOpened],
@@ -100,7 +101,21 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     private capabilitiesLoaded: boolean = false;
     private loadCapabilitiesPromise: Promise<void> | null = null;
 
-    constructor (address: string, public port: string, username: string, password: string, public console: Console, public storage: Storage)
+    // Call status polling control
+    private useCallStatusPolling: boolean = true;
+
+    // Alert stream health tracking
+    private alertTick?: number;
+
+    constructor (
+        address: string, 
+        public port: string, 
+        username: string, 
+        password: string, 
+        callStatusPolling: boolean,
+        public console: Console, 
+        public storage: Storage
+    )
     {
         let endpoint = libip.isV4Format(address) ? `${address}:${port}` : `[${address}]:${port}`;
         super (endpoint, username, password, console);
@@ -109,6 +124,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         
         // Initialize door capabilities
         this.initializeDoorCapabilities();
+        this.useCallStatusPolling = callStatusPolling;
     }
 
     destroy(): void 
@@ -116,7 +132,6 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         this.listener?.destroy();
         this.eventServer?.close();
         this.stopAlertStream();
-        this.stopCallStatusPolling();
     }
 
     override async request (urlOrOptions: string | HttpFetchOptions<Readable>, body?: AuthRequestBody)
@@ -211,12 +226,29 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             await this.listenAlertStream();
             this.console.info ('Using alert stream for events');
 
-            this.startCallStatusPolling();
-            this.console.info ('Call status polling started');
+            if (this.useCallStatusPolling) {
+                this.startCallStatusPolling();
+                this.console.info ('Call status polling started');
+            } else {
+                this.console.info ('Call status polling disabled (using SIP)');
+            }
 
             this.listener = new HikvisionDoorbell_Destroyable (() => {
                 this.listener = undefined;
-                this.stopAlertStream();
+                
+                // Check if alert stream tick occurred more than timeout
+                if (this.alertTick) {
+                    const timeSinceLastTick = Date.now() - this.alertTick;
+                    const timeoutMs = alertTickTimeoutSec * 1000;
+                    
+                    if (timeSinceLastTick > timeoutMs) {
+                        this.console.info (`Alert stream last tick ${(timeSinceLastTick / 1000).toFixed (1)}s ago, stopping alert stream`);
+                        this.stopAlertStream();
+                    } else {
+                        this.console.debug (`Alert stream last tick ${(timeSinceLastTick / 1000).toFixed (1)}s ago, keeping alert stream active`);
+                    }
+                }
+                
                 this.stopCallStatusPolling();
             });
         }
@@ -681,7 +713,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             
             const callData = JSON.parse (response.body);
 
-            this.console.debug (`Call status: ${JSON.stringify (callData)}`);
+            // this.console.debug (`Call status: ${JSON.stringify (callData)}`);
 
             const callState = callData.CallStatus?.status || 'idle';
             return callState;
@@ -997,9 +1029,12 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
      */
     async listenAlertStream()
     {
-        try {
-            this.stopAlertStream();
-
+        if (this.alertStream) {
+            this.console.debug ('Alert stream already listening');
+            return;
+        }
+        try 
+        {
             const { body } = await this.request({
                 url: `http://${this.endpoint}/ISAPI/Event/notification/alertStream`,
                 responseType: 'readable',
@@ -1096,7 +1131,8 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
     
         // Map JSON events to existing HikvisionDoorbellEvent enum
         if (eventType === 'videoloss') {
-            // Video loss events - not typically used for doorbell
+            // Track alert stream tick time
+            this.alertTick = Date.now();
             return;
         }
 
