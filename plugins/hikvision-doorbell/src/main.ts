@@ -6,8 +6,8 @@ import { createRtspMediaStreamOptions, RtspProvider, UrlMediaStreamOptions } fro
 import { startRtpForwarderProcess } from '../../webrtc/src/rtp-forwarders';
 import { HikvisionDoorbellAPI, HikvisionDoorbellEvent } from "./doorbell-api";
 import { SipManager, SipRegistration, SipAudioTarget } from "./sip-manager";
-import { parseBooleans, parseNumbers } from "xml2js/lib/processors";
-import { once, EventEmitter } from 'node:events';
+import { parseNumbers } from "xml2js/lib/processors";
+import { EventEmitter } from 'node:events';
 import { timeoutPromise } from "@scrypted/common/src/promise-utils";
 import { HikvisionLock } from "./lock"
 import { HikvisionEntrySensor } from "./entry-sensor"
@@ -15,8 +15,9 @@ import { HikvisionTamperAlert } from "./tamper-alert"
 import * as fs from 'fs/promises';
 import { join } from 'path';
 import { makeDebugConsole, DebugController } from "./debug-console";
+import { RtpMultiplexer } from "./rtp-multiplexer";
 
-const { mediaManager, deviceManager } = sdk;
+const { mediaManager } = sdk;
 
 const PROVIDED_DEVICES_KEY: string = 'providedDevices';
 
@@ -41,6 +42,7 @@ const DEFAULT_BUTTON_NUMBER: string = '1';
 const LOCK_AUDIO_NOTIFY_SEC: number = 3  // Duration to play audio notification after door unlock
 const UNREACHED_RETRY_SEC: number = 10  // Retry timeout when device is unreachable
 const CANCEL_CALL_DELAY_SEC: number = 3  // Delay before killing active intercom after cancelCall
+const GRACE_PERIOD_SEC: number = 2  // Grace period for seamless SIP reconnection
 
 function channelToCameraNumber(channel: string) {
     if (!channel)
@@ -67,6 +69,14 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     // intercom state protection
     private intercomBusy: boolean = false;
     private stopIntercomQueue: Promise<void> = Promise.resolve();
+    
+    // grace period for seamless reconnection
+    private gracePeriodTimer?: NodeJS.Timeout;
+    private waitingForReconnect: boolean = false;
+    
+    // RTP multiplexer for seamless target switching
+    private rtpMultiplexer?: RtpMultiplexer;
+    private currentTargetId: string = 'primary';
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
@@ -81,6 +91,9 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
 
     destroy(): void
     {
+        this.clearGracePeriod();
+        this.rtpMultiplexer?.destroy();
+        this.rtpMultiplexer = undefined;
         this.sipManager?.stop();
         this.getEventApi()?.destroy();
     }
@@ -109,19 +122,15 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                         break;
                 
                     default:
+                        const callId = this.storage.getItem (SIP_SERVER_PROXY_PHONE_KEY) || DEFAULT_PROXY_PHONE;
                         let port = parseInt (this.storage.getItem (SIP_SERVER_PORT_KEY));
-                        if (port) {
-                            await this.sipManager.startGateway (port);    
-                        }
-                        else {
-                            await this.sipManager.startGateway();    
-                        }
+                        await this.sipManager.startGateway (callId, port);    
                         this.installSipSettingsOnDevice();
                         break;
                 }
             }
 
-            this.updateInviteHandler();
+            this.configureSipHandlers();
         })();
     }
 
@@ -246,22 +255,141 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         }
     }
 
-    private createSipAudioTrack (target: SipAudioTarget, codec: string)
+    private createSipAudioTrack (codec: string, useMultiplexer: boolean = false)
     {
-        return {
-            onRtp: (rtp: Buffer) => {
-                // RTP packets sent directly by ffmpeg to target
-                this.console.debug (`RTP packet sent to ${target.ip}:${target.port}`);
-            },
-            codecCopy: codec,
-            encoderArguments: [
-                '-ar', '8000',
-                '-ac', '1',
-                '-acodec', codec,
-                '-f', 'rtp',
-                `rtp://${target.ip}:${target.port}`,
-            ]
-        };
+        let flag = true;
+        
+        if (useMultiplexer) {
+            // Use multiplexer for target switching support
+            return {
+                onRtp: (rtp: Buffer) => {
+                    if (flag) {
+                        this.console.debug ('First RTP packet, sending to multiplexer');
+                        flag = false;
+                    }
+                    // Send to multiplexer which will distribute to all targets
+                    this.rtpMultiplexer?.sendRtp (rtp);
+                },
+                codecCopy: codec,
+                encoderArguments: [
+                    '-ar', '8000',
+                    '-ac', '1',
+                    '-acodec', codec,
+                ]
+            };
+        } else {
+            // Direct RTP mode (fallback if multiplexer not used)
+            const target = this.sipManager?.remoteAudioTarget;
+            if (!target) {
+                throw new Error ('No remote audio target available');
+            }
+            
+            return {
+                onRtp: (rtp: Buffer) => {
+                    if (flag) {
+                        this.console.debug (`First RTP packet sent to ${target.ip}:${target.port}`);
+                        flag = false;
+                    }
+                },
+                codecCopy: codec,
+                encoderArguments: [
+                    '-ar', '8000',
+                    '-ac', '1',
+                    '-acodec', codec,
+                    '-f', 'rtp',
+                    `rtp://${target.ip}:${target.port}`,
+                ]
+            };
+        }
+    }
+
+    private clearGracePeriod()
+    {
+        if (this.gracePeriodTimer) {
+            clearTimeout (this.gracePeriodTimer);
+            this.gracePeriodTimer = undefined;
+        }
+        this.waitingForReconnect = false;
+    }
+
+    private async attemptSipReconnection(): Promise<void>
+    {
+        this.console.info ('Grace period expired, attempting reconnection via INVITE');
+        this.clearGracePeriod();
+        
+        // Check if intercom is still active before attempting reconnection
+        if (!this.activeIntercom || this.activeIntercom.killed) 
+        {
+            this.console.info ('Intercom was stopped during grace period, skipping reconnection');
+            return;
+        }
+        
+        const mng = this.sipManager;
+        if (!mng) 
+        {
+            this.console.error ('SIP manager not available, stopping intercom');
+            await this.stopIntercom();
+            return;
+        }
+        
+        // Try to send INVITE to doorbell to re-establish connection
+        try 
+        {
+            const inviteSuccess = await mng.invite();
+            if (inviteSuccess) 
+            {
+                this.console.info ('INVITE successful, received SDP response');
+                
+                // Switch to new audio target from SDP response
+                const switched = await this.switchAudioTarget();
+                if (!switched) {
+                    this.console.error ('Failed to switch audio target, stopping intercom');
+                    await this.stopIntercom();
+                    return;
+                }
+                
+                this.console.info ('Reconnection successful via INVITE');
+            } 
+            else 
+            {
+                this.console.warn ('INVITE failed, stopping intercom');
+                await this.stopIntercom();
+            }
+        } 
+        catch (error) 
+        {
+            this.console.error ('Error during reconnection attempt:', error);
+            await this.stopIntercom();
+        }
+    }
+
+    private async switchAudioTarget (): Promise<boolean>
+    {
+        if (!this.rtpMultiplexer) {
+            this.console.warn ('Cannot switch audio target: multiplexer not initialized');
+            return false;
+        }
+
+        const newTarget = this.sipManager?.remoteAudioTarget;
+        if (!newTarget) {
+            this.console.error ('Cannot switch audio target: missing remote audio target');
+            return false;
+        }
+
+        try {
+            this.console.info (`Switching audio target to ${newTarget.ip}:${newTarget.port}`);
+            
+            // Remove old target and add new target in multiplexer
+            // This allows seamless switching without killing the forwarder
+            this.rtpMultiplexer.removeTarget (this.currentTargetId);
+            this.rtpMultiplexer.addTarget (this.currentTargetId, newTarget.ip, newTarget.port);
+            
+            this.console.info ('Audio target switched successfully');
+            return true;
+        } catch (error) {
+            this.console.error ('Failed to switch audio target:', error);
+            return false;
+        }
     }
 
     override createClient() {
@@ -694,6 +822,13 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 format = 'mulaw'
             }
 
+            // Set codec for SIP manager
+            if (this.sipManager) {
+                this.sipManager.audioCodec = codec;
+                // Invite if needed
+                await this.sipManager.invite();
+            }
+
             const buffer = await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput);
             const ffmpegInput = JSON.parse(buffer.toString()) as FFmpegInput;
 
@@ -721,7 +856,16 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             // Configure audio track based on mode (SIP or HTTP)
             let audioTrack;
             if (sipAudioTarget) {
-                audioTrack = this.createSipAudioTrack (sipAudioTarget, codec);
+                // Initialize multiplexer if not exists
+                if (!this.rtpMultiplexer) {
+                    this.rtpMultiplexer = new RtpMultiplexer (this.console);
+                }
+                
+                // Add initial target to multiplexer
+                this.rtpMultiplexer.addTarget (this.currentTargetId, sipAudioTarget.ip, sipAudioTarget.port);
+                
+                // Create audio track with multiplexer enabled
+                audioTrack = this.createSipAudioTrack (codec, true);
             } else {
                 // HTTP mode needs buffer accumulation
                 let available = Buffer.alloc(0);
@@ -752,21 +896,26 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
 
             // Single cleanup
             forwarder.killPromise.finally(() => {
-                this.console.debug ('Audio finished, cleaning up');
-                try {
-                    if (passthrough) {
-                        passthrough.end();
+                // Only cleanup if this is still the active forwarder
+                if (this.activeIntercom === forwarder) 
+                {
+                    this.console.debug ('Audio finished, cleaning up');
+                    try {
+                        if (passthrough) {
+                            passthrough.end();
+                        }
+                        if (!sipAudioTarget) {
+                            this.getClient().closeTwoWayAudio (channel, sessionId);
+                        }
+                    } catch (e) {
+                        // Ignore if already ended
                     }
-                    if (!sipAudioTarget) {
-                        this.getClient().closeTwoWayAudio(channel, sessionId);
-                    }
-                } catch (e) {
-                    // Ignore if already ended
+                    
+                    // Reset state without calling stopIntercom recursively
+                    this.activeIntercom = undefined;
+                } else {
+                    this.console.debug ('Old forwarder finished, ignoring cleanup (new forwarder is active)');
                 }
-                
-                // Reset state without calling stopIntercom recursively
-                this.activeIntercom = undefined;
-                this.intercomBusy = false;
             });
             
             if (put) {
@@ -794,7 +943,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         } catch (error) {
             // Reset state on error
             if (!sipAudioTarget) {
-                await this.getClient().closeTwoWayAudio(channel, sessionId);
+                await this.getClient().closeTwoWayAudio (channel, sessionId);
             }
             this.intercomBusy = false;
             throw error;
@@ -812,6 +961,9 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
 
             this.console.debug ('Stopping intercom');
             
+            // Clear grace period if active
+            this.clearGracePeriod();
+            
             try 
             {
                 // Kill the forwarder if exists
@@ -820,7 +972,18 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 }
                 this.activeIntercom = undefined;
 
-                await this.getClient().hangUpCall();
+                // Cleanup multiplexer
+                if (this.rtpMultiplexer) {
+                    this.rtpMultiplexer.destroy();
+                    this.rtpMultiplexer = undefined;
+                }
+
+                if (this.sipManager) {
+                    await this.sipManager.hangup();
+                }
+                else {
+                    await this.getClient().hangUpCall();
+                }
             } finally {
                 // Always reset state
                 this.intercomBusy = false;
@@ -938,6 +1101,15 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                         placeholder: 'CallId',
                         type: 'string',
                     },
+                    {
+                        subgroup: 'Connect to SIP Proxy',
+                        key: SIP_SERVER_DOORBELL_PHONE_KEY,
+                        title: 'Doorbell Caller ID',
+                        description: 'Caller ID (Phone number) that will represent the doorbell',
+                        value: this.storage.getItem (SIP_SERVER_DOORBELL_PHONE_KEY),
+                        type: 'integer',
+                        placeholder: DEFAULT_DOORBELL_PHONE
+                    },
                 ];
         
             case SipMode.Server:
@@ -1027,21 +1199,63 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             password: this.storage.getItem (SIP_CLIENT_PASSWORD_KEY) || '',
             ip: this.storage.getItem (SIP_CLIENT_PROXY_IP_KEY) || '',
             port: parseNumbers (this.storage.getItem (SIP_CLIENT_PROXY_PORT_KEY) || '5060'),
-            callId: this.storage.getItem (SIP_CLIENT_CALLID_KEY) || ''
+            callId: this.storage.getItem (SIP_CLIENT_CALLID_KEY) || '',
+            doorbellId: this.storage.getItem (SIP_SERVER_DOORBELL_PHONE_KEY) || DEFAULT_DOORBELL_PHONE
           }
     }
 
-    private updateInviteHandler()
+    private configureSipHandlers()
     {
         const sipMode = this.getSipMode();
-        
-        if (sipMode !== SipMode.Off && this.sipManager)
+        const mng = this.sipManager;
+        if (sipMode !== SipMode.Off && mng)
         {
             // Use SIP for invite detection
             this.console.debug ('Using SIP for invite detection');
             
-            this.sipManager.setOnInviteHandler ((audioTarget) => {
-                this.console.debug (`SIP INVITE received, audio target: ${audioTarget?.ip}:${audioTarget?.port}`);
+            mng.setOnInviteHandler (async () => {
+                this.console.debug (`SIP INVITE received`);
+                
+                // Check if we're waiting for reconnection during grace period
+                if (this.waitingForReconnect && this.activeIntercom) 
+                {
+                    this.console.info ('(SIP) Received INVITE during grace period, attempting seamless reconnection');
+                    
+                    // Clear grace period timer
+                    this.clearGracePeriod();
+                    
+                    // Accept the new invite
+                    try {
+                        await mng.answer();
+                        
+                        // Get new audio target from SIP manager
+                        if (mng.remoteAudioTarget) 
+                        {
+                            
+                            // Switch to new audio target
+                            const switched = await this.switchAudioTarget();
+                            if (!switched) {
+                                this.console.error ('Failed to switch audio target, stopping intercom');
+                                await this.stopIntercom();
+                                return;
+                            }
+                        } 
+                        else 
+                        {
+                            this.console.warn ('No audio target in new INVITE, stopping intercom');
+                            await this.stopIntercom();
+                            return;
+                        }
+                        
+                        this.console.info ('Seamless reconnection successful');
+                    } catch (error) {
+                        this.console.error ('Failed to accept INVITE during reconnection:', error);
+                        // Fallback: stop intercom
+                        await this.stopIntercom();
+                    }
+                    return;
+                }
+                
                 if (this.activeIntercom) 
                 {
                     this.console.debug ('(SIP) Doorbell is busy, starting cancelCall');
@@ -1053,9 +1267,35 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 this.binaryState = true;
             });
 
-            this.sipManager.setOnHangupHandler (() => {
-                this.console.debug ('SIP BYE received');
+            mng.setOnStopRingingHandler (() => {
+                this.console.debug ('SIP stop ringing');
                 this.binaryState = false;
+            });
+            
+            mng.setOnHangupHandler (async () => {
+                this.console.debug ('SIP BYE received');
+                
+                // Check if intercom is active
+                if (this.activeIntercom && !this.activeIntercom.killed) 
+                {
+                    this.console.info ('Intercom is active, starting grace period for reconnection');
+                    
+                    // Clear any existing timer
+                    this.clearGracePeriod();
+                    
+                    // Set flag that we're waiting for reconnection
+                    this.waitingForReconnect = true;
+                    
+                    // Start grace period timer
+                    this.gracePeriodTimer = setTimeout (() => {
+                        this.attemptSipReconnection();
+                    }, GRACE_PERIOD_SEC * 1000);
+                    
+                    this.console.debug (`Waiting ${GRACE_PERIOD_SEC}s for potential reconnection`);
+                } else {
+                    // No active intercom, just stop normally
+                    await this.stopIntercom();
+                }
             });
 
             return;
