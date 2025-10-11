@@ -214,7 +214,6 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         // support multiple cameras listening to a single stream 
         if (!this.listener) 
         {
-            
             // Load device timezone before starting event polling
             try {
                 await this.getDeviceTimezone();
@@ -511,6 +510,9 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
                 method: 'PUT',
                 responseType: 'text',
             }, data);
+            
+            // Check for error responses before proceeding
+            await this.checkResponseStatus (response, `Control door ${doorNo} with command '${command}'`);
             
             this.console.debug(`Door control response: ${response.statusCode} - ${response.body}`);
             return response;

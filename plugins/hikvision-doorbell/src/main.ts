@@ -16,6 +16,7 @@ import * as fs from 'fs/promises';
 import { join } from 'path';
 import { makeDebugConsole, DebugController } from "./debug-console";
 import { RtpMultiplexer } from "./rtp-multiplexer";
+import { HttpStreamSwitcher, HttpSession } from "./http-stream-switcher";
 
 const { mediaManager } = sdk;
 
@@ -43,6 +44,7 @@ const LOCK_AUDIO_NOTIFY_SEC: number = 3  // Duration to play audio notification 
 const UNREACHED_RETRY_SEC: number = 10  // Retry timeout when device is unreachable
 const CANCEL_CALL_DELAY_SEC: number = 3  // Delay before killing active intercom after cancelCall
 const GRACE_PERIOD_SEC: number = 2  // Grace period for seamless SIP reconnection
+const HTTP_SWITCH_DELAY_SEC: number = 1  // Delay between closing old and opening new HTTP session
 
 function channelToCameraNumber(channel: string) {
     if (!channel)
@@ -74,9 +76,15 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     private gracePeriodTimer?: NodeJS.Timeout;
     private waitingForReconnect: boolean = false;
     
-    // RTP multiplexer for seamless target switching
+    // RTP multiplexer for seamless target switching (SIP mode)
     private rtpMultiplexer?: RtpMultiplexer;
     private currentTargetId: string = 'primary';
+    
+    // HTTP stream switcher for seamless reconnection (ISAPI mode)
+    private httpStreamSwitcher?: HttpStreamSwitcher;
+    
+    // Dedicated API client for event handling
+    private eventApi?: HikvisionDoorbellAPI;
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
@@ -94,8 +102,13 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         this.clearGracePeriod();
         this.rtpMultiplexer?.destroy();
         this.rtpMultiplexer = undefined;
+        this.httpStreamSwitcher?.destroy();
+        this.httpStreamSwitcher = undefined;
         this.sipManager?.stop();
-        this.getEventApi()?.destroy();
+        this.eventApi?.destroy();
+        this.eventApi = undefined;
+        (this.client as HikvisionDoorbellAPI)?.destroy();
+        this.client = undefined;
     }
 
     async getReadmeMarkdown(): Promise<string> 
@@ -141,8 +154,10 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     override async listenEvents() 
     {
         let motionTimeout: NodeJS.Timeout;
-        const api = this.getEventApi();
-        const events = await api.listenEvents();
+        if (!this.eventApi) {
+            this.eventApi = this.createEventApi();
+        }
+        const events = await this.eventApi.listenEvents();
 
         let motionPingsNeeded = parseInt(this.storage.getItem('motionPings')) || 1;
         const motionTimeoutDuration = (parseInt(this.storage.getItem('motionTimeout')) || 10) * 1000;
@@ -177,10 +192,26 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 this.console.info (`Doorbell ${event.toString()} detected`);
                 if (this.intercomBusy && invite) 
                 {
-                    this.console.debug ('Doorbell is busy, starting cancelCall');
-                    // Execute cancelCall without blocking the event handler
-                    this.cancelCall();
-                    this.console.debug ('Doorbell is busy, ignore invite');
+                    this.cancelCall().then(() => {
+                        // Check if we're in ISAPI mode (no SIP) and can do seamless reconnection
+                        if (!this.sipManager && this.httpStreamSwitcher) 
+                        {
+                            this.console.info ('(ISAPI) Received TalkInvite during active intercom, attempting seamless reconnection');
+
+                            // Attempt to reconnect HTTP session without stopping audio forwarder
+                            this.switchHttpSession().then (session => {
+                                if (session) {
+                                    this.console.info('Seamless HTTP reconnection successful');
+                                } else {
+                                    this.console.warn('Failed to reconnect HTTP session, stopping intercom');
+                                    this.stopIntercom();
+                                }
+                            }).catch(e => {
+                                this.console.error('Error during HTTP reconnection:', e);
+                                this.stopIntercom();
+                            });
+                        }
+                    });
                     return;
                 }
 
@@ -244,10 +275,6 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             else {
                 await this.getClient().cancelCall();
             }
-            // Wait before killing the active intercom
-            await new Promise (resolve => setTimeout (resolve, CANCEL_CALL_DELAY_SEC * 1000));
-            this.activeIntercom?.kill();
-            this.console.debug ('Stopped intercom by kill activeIntercom');
         }
         catch (e)
         {
@@ -389,6 +416,106 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         } catch (error) {
             this.console.error ('Failed to switch audio target:', error);
             return false;
+        }
+    }
+
+    private setupPutPromiseHandlers (put: Promise<any>): void
+    {
+        put.finally (() => {
+            // Only kill forwarder if this is still the current PUT request
+            if (this.activeIntercom && !this.activeIntercom.killed && this.httpStreamSwitcher?.isCurrentPutPromise (put)) {
+                this.console.debug ('Current PUT finished, cleaning up');
+                this.activeIntercom.kill();
+            } else if (!this.httpStreamSwitcher?.isCurrentPutPromise (put)) {
+                this.console.debug ('Old PUT finished, ignoring (new session active)');
+            }
+        });
+        
+        // The PUT request will be open until the passthrough is closed
+        put.then (response => {
+            // Only kill forwarder if this is still the current PUT request
+            if (response.statusCode !== 200 && this.activeIntercom && !this.activeIntercom.killed && this.httpStreamSwitcher?.isCurrentPutPromise (put)) {
+                this.console.debug ('Current PUT finished with non-200 status code, cleaning up');
+                this.activeIntercom.kill();
+            }
+        })
+            .catch (() => {
+                // Only kill forwarder if this is still the current PUT request
+                if (this.activeIntercom && !this.activeIntercom.killed && this.httpStreamSwitcher?.isCurrentPutPromise (put)) {
+                    this.console.debug ('Current PUT finished with error, cleaning up');
+                    this.activeIntercom.kill();
+                }
+            });
+    }
+
+    private async switchHttpSession (initialSetup: boolean = false): Promise<HttpSession | null>
+    {
+        // Initialize switcher if not exists (only for initial setup)
+        if (!this.httpStreamSwitcher) {
+            if (initialSetup) {
+                this.httpStreamSwitcher = new HttpStreamSwitcher (this.console);
+            } else {
+                this.console.warn ('Cannot switch HTTP session: switcher not initialized');
+                return null;
+            }
+        }
+
+        try {
+            if (initialSetup) {
+                this.console.info ('Initializing HTTP session');
+            } else {
+                this.console.info ('Switching HTTP session for seamless reconnection');
+            }
+            
+            const channel = this.getRtspChannel() || '1';
+            
+            // Store old session info for cleanup
+            const oldSessionId = this.httpStreamSwitcher.getCurrentSessionId();
+            
+            // Close old session BEFORE opening new one (required by device)
+            if (oldSessionId) {
+                try {
+                    await this.getClient().closeTwoWayAudio (channel, oldSessionId);
+                    this.console.debug (`Old HTTP session ${oldSessionId} closed before opening new`);
+                } catch (e) {
+                    this.console.warn (`Failed to close old session ${oldSessionId}:`, e);
+                }
+                
+                // Wait before opening new session
+                await new Promise (resolve => setTimeout (resolve, HTTP_SWITCH_DELAY_SEC * 1000));
+                this.console.debug (`Waited ${HTTP_SWITCH_DELAY_SEC}s before opening new session`);
+            }
+            
+            // Open new HTTP session
+            const newPassthrough = new PassThrough();
+            const result = await this.getClient().openTwoWayAudio (channel, newPassthrough);
+            const newSessionId = result.sessionId;
+            const newPut = result.result;
+            
+            // Create session object and switch
+            const newSession: HttpSession = {
+                sessionId: newSessionId,
+                stream: newPassthrough,
+                putPromise: newPut
+            };
+            
+            this.httpStreamSwitcher.switchSession (newSession);
+            
+            if (oldSessionId) {
+                this.console.info (`HTTP session switched: ${oldSessionId} -> ${newSessionId}`);
+            } else {
+                this.console.debug (`HTTP session ${newSessionId} connected to switcher`);
+            }
+            
+            // Setup PUT promise handlers if forwarder is active
+            if (this.activeIntercom) {
+                this.setupPutPromiseHandlers (newPut);
+            }
+            
+            return newSession;
+        } catch (error) {
+            this.console.error ('Failed to switch HTTP session:', error);
+            return null;
         }
     }
 
@@ -663,8 +790,11 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     }
 
     override async putSetting(key: string, value: string) {
-        this.client = undefined;
         this.detectedChannels = undefined;
+        this.eventApi?.destroy();
+        this.eventApi = undefined;
+        (this.client as HikvisionDoorbellAPI)?.destroy();
+        this.client = undefined;
 
         // remove 0 port for autoselect port number
         if (key === SIP_SERVER_PORT_KEY && value === '0') { 
@@ -784,7 +914,6 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         this.console.debug ('Starting intercom');
         
         let channel: string = '1';
-        let sessionId: string | undefined;
         let sipAudioTarget: SipAudioTarget | undefined;
         
         try 
@@ -835,15 +964,12 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             // Check if we have SIP audio target
             sipAudioTarget = this.sipManager?.remoteAudioTarget;
             
-            let passthrough: PassThrough | undefined;
-            let put: Promise<any> | undefined;
-            
             if (!sipAudioTarget) {
-                // Use HTTP method
-                passthrough = new PassThrough();
-                const result = await this.getClient().openTwoWayAudio(channel, passthrough);
-                sessionId = result.sessionId;
-                put = result.result;
+                // Use HTTP method with switcher
+                const session = await this.switchHttpSession (true);
+                if (!session) {
+                    throw new Error ('Failed to initialize HTTP session');
+                }
             } else {
                 this.console.info (`Using SIP RTP target: ${sipAudioTarget.ip}:${sipAudioTarget.port}`);
             }
@@ -867,15 +993,16 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 // Create audio track with multiplexer enabled
                 audioTrack = this.createSipAudioTrack (codec, true);
             } else {
-                // HTTP mode needs buffer accumulation
-                let available = Buffer.alloc(0);
+                // HTTP mode needs buffer accumulation, write to switcher
+                let available = Buffer.alloc (0);
                 audioTrack = {
                     onRtp: (rtp: Buffer) => {
                         const parsed = RtpPacket.deSerialize (rtp);
                         available = Buffer.concat ([available, parsed.payload]);
                         if (available.length > 1024) {
                             const data = available.subarray (0, 1024);
-                            passthrough!.push (data);
+                            // Write to switcher instead of directly to passthrough
+                            this.httpStreamSwitcher?.write (data);
                             available = available.subarray (1024);
                         }
                     },
@@ -894,18 +1021,30 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 { audio: audioTrack }
             );
 
+            // Setup PUT promise handlers for initial session after forwarder is created
+            // so when calling we need this.activeIntercom to be populated
+            // Only for HTTP mode (switcher has the putPromise)
+            if (!sipAudioTarget && this.httpStreamSwitcher) {
+                const currentSession = this.httpStreamSwitcher.getCurrentSession();
+                if (currentSession) {
+                    this.setupPutPromiseHandlers (currentSession.putPromise);
+                }
+            }
+
             // Single cleanup
-            forwarder.killPromise.finally(() => {
+            forwarder.killPromise.finally (() => {
                 // Only cleanup if this is still the active forwarder
                 if (this.activeIntercom === forwarder) 
                 {
                     this.console.debug ('Audio finished, cleaning up');
                     try {
-                        if (passthrough) {
-                            passthrough.end();
-                        }
-                        if (!sipAudioTarget) {
-                            this.getClient().closeTwoWayAudio (channel, sessionId);
+                        // HTTP mode cleanup - close current active session (not captured sessionId)
+                        if (!sipAudioTarget && this.httpStreamSwitcher) {
+                            const currentSessionId = this.httpStreamSwitcher.getCurrentSessionId();
+                            if (currentSessionId) {
+                                this.getClient().closeTwoWayAudio (channel, currentSessionId);
+                                this.console.debug (`Closed HTTP session ${currentSessionId} on forwarder finish`);
+                            }
                         }
                     } catch (e) {
                         // Ignore if already ended
@@ -917,33 +1056,17 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                     this.console.debug ('Old forwarder finished, ignoring cleanup (new forwarder is active)');
                 }
             });
-            
-            if (put) {
-                put.finally(() => {
-                    if (forwarder && !forwarder.killed) {
-                        this.console.debug ('Put finished, cleaning up');
-                        forwarder.kill();
-                    }
-                });
-                
-                // the put request will be open until the passthrough is closed.
-                put.then(response => {
-                    if (response.statusCode !== 200 && forwarder && !forwarder.killed) {
-                        this.console.debug ('Put finished with non-200 status code, cleaning up');
-                        forwarder.kill();
-                    }
-                })
-                    .catch(() => {
-                        if (forwarder && !forwarder.killed) {
-                            this.console.debug ('Put finished with error, cleaning up');
-                            forwarder.kill();
-                        }
-                    });
-            }
         } catch (error) {
             // Reset state on error
-            if (!sipAudioTarget) {
-                await this.getClient().closeTwoWayAudio (channel, sessionId);
+            if (!sipAudioTarget && this.httpStreamSwitcher) {
+                const currentSessionId = this.httpStreamSwitcher.getCurrentSessionId();
+                if (currentSessionId) {
+                    try {
+                        await this.getClient().closeTwoWayAudio (channel, currentSessionId);
+                    } catch (e) {
+                        this.console.warn (`Failed to close HTTP session ${currentSessionId} on error:`, e);
+                    }
+                }
             }
             this.intercomBusy = false;
             throw error;
@@ -972,7 +1095,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 }
                 this.activeIntercom = undefined;
 
-                // Cleanup multiplexer
+                // Cleanup multiplexers
                 if (this.rtpMultiplexer) {
                     this.rtpMultiplexer.destroy();
                     this.rtpMultiplexer = undefined;
@@ -982,7 +1105,25 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                     await this.sipManager.hangup();
                 }
                 else {
+                    // ISAPI mode: close HTTP session if active
+                    const currentSessionId = this.httpStreamSwitcher?.getCurrentSessionId();
+                    if (currentSessionId) {
+                        const channel = this.getRtspChannel() || '1';
+                        try {
+                            await this.getClient().closeTwoWayAudio (channel, currentSessionId);
+                            this.console.debug (`Closed HTTP session ${currentSessionId}`);
+                        } catch (e) {
+                            this.console.warn (`Failed to close HTTP session ${currentSessionId}:`, e);
+                        }
+                    }
+                    
                     await this.getClient().hangUpCall();
+                }
+                
+                // Destroy HTTP stream switcher after closing session
+                if (this.httpStreamSwitcher) {
+                    this.httpStreamSwitcher.destroy();
+                    this.httpStreamSwitcher = undefined;
                 }
             } finally {
                 // Always reset state
@@ -998,16 +1139,17 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         return stopPromise;
     }
 
-    private getEventApi()
+    private createEventApi(): HikvisionDoorbellAPI
     {
-        return (this.provider as HikvisionDoorbellProvider).createSharedClient(
+        return new HikvisionDoorbellAPI (
             this.getIPAddress(), 
             this.getHttpPort(), 
             this.getUsername(), 
             this.getPassword(), 
             this.isCallPolling(),
             this.console,
-            this.storage);
+            this.storage
+        );
     }
 
     private async stopRing()
@@ -1258,9 +1400,6 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 
                 if (this.activeIntercom) 
                 {
-                    this.console.debug ('(SIP) Doorbell is busy, starting cancelCall');
-                    // Execute cancelCall without blocking the event handler
-                    this.cancelCall();
                     this.console.debug ('(SIP) Doorbell is busy, ignore invite');
                     return;
                 }
@@ -1312,8 +1451,6 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
 export class HikvisionDoorbellProvider extends RtspProvider
 {
     static CAMERA_NATIVE_ID_KEY: string = 'cameraNativeId';
-    
-    clients: Map<string, HikvisionDoorbellAPI>;
 
     constructor() {
         super();
@@ -1329,28 +1466,6 @@ export class HikvisionDoorbellProvider extends RtspProvider
             ScryptedInterface.Camera,
             ScryptedInterface.MotionSensor,
         ];
-    }
-
-    createSharedClient (
-        ip: string, 
-        port: string, 
-        username: string, 
-        password: string,
-        callStatusPolling: boolean,
-        console: Console, 
-        storage: Storage) 
-    {
-        if (!this.clients)
-            this.clients = new Map();
-
-        const key = `${ip}#${port}#${username}#${password}`;
-        const check = this.clients.get(key);
-        if (check) 
-            return check;
-        
-        const client = new HikvisionDoorbellAPI (ip, port, username, password, callStatusPolling, console, storage);
-        this.clients.set (key, client);
-        return client;
     }
 
     override createCamera(nativeId: string) {

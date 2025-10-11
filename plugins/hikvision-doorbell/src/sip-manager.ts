@@ -581,12 +581,17 @@ export class SipManager {
       uri = rq.headers.from.uri;
     }
 
+    // In SIP dialog, BYE From/To depend on who initiated the call
+    // If we received INVITE (server mode): swap headers
+    // If we sent INVITE (client mode): keep headers as is
+    const isServerMode = rq.method === 'INVITE';
+    
     let msg = {
       method: 'BYE',
       uri: uri,
       headers: {
-        to: rq.headers.to,
-        from: rq.headers.from,
+        to: isServerMode ? rq.headers.from : rq.headers.to,
+        from: isServerMode ? rq.headers.to : rq.headers.from,
         'call-id': rq.headers['call-id'],
         cseq: {method: 'BYE', seq: rq.headers.cseq.seq + 1},
         contact: `sip:${this.callId}@${this.localIp}:${this.localPort}` 
