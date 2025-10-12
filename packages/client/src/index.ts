@@ -1,4 +1,4 @@
-import { MediaObjectCreateOptions, ScryptedStatic } from "@scrypted/types";
+import { MediaObjectCreateOptions, ScryptedStatic, ConnectRPCObjectOptions } from "@scrypted/types";
 import * as eio from 'engine.io-client';
 import { SocketOptions } from 'engine.io-client';
 import { timeoutPromise } from "../../../common/src/promise-utils";
@@ -52,7 +52,13 @@ function once(socket: IOClientSocket, event: 'open' | 'message') {
     });
 }
 
-export type ScryptedClientConnectionType = 'http' | 'http-direct';
+/**
+ * The type of connection used by the Scrypted client.
+ * http-cloud is through Scrypted Cloud
+ * http-direct is a direct connection to the Scrypted server via one of the local network interfaces or public IP addresses.
+ * http is a direct connection with the base url or browser url.
+ */
+export type ScryptedClientConnectionType = 'http-cloud' | 'http-direct' | 'http';
 
 export interface ScryptedClientStatic extends ScryptedStatic {
     userId?: string;
@@ -382,11 +388,11 @@ export async function connectScryptedClient(options: ScryptedClientOptions): Pro
     const eioPath = `endpoint/${pluginId}/engine.io/api`;
     const eioEndpoint = baseUrl ? new URL(eioPath, baseUrl).pathname : '/' + eioPath;
     // https://github.com/socketio/engine.io/issues/690
-    const cacehBust = Math.random().toString(36).substring(3, 10);
+    const cacheBust = Math.random().toString(36).substring(3, 10);
     const eioOptions: Partial<SocketOptions> = {
         path: eioEndpoint,
         query: {
-            cacehBust,
+            cacheBust,
         },
         withCredentials: true,
         extraHeaders,
@@ -486,7 +492,7 @@ export async function connectScryptedClient(options: ScryptedClientOptions): Pro
         return {
             ready: check,
             address: explicitBaseUrl,
-            connectionType: 'http',
+            connectionType: scryptedCloud ? 'http-cloud' : 'http',
         };
     })());
 
@@ -567,62 +573,136 @@ export async function connectScryptedClient(options: ScryptedClientOptions): Pro
             .find(device => device.pluginId === '@scrypted/core' && device.nativeId === `user:${username}`);
 
         const clusterPeers = new Map<number, Promise<RpcPeer>>();
-        const ensureClusterPeer = (clusterObject: ClusterObject) => {
-            let clusterPeerPromise = clusterPeers.get(clusterObject.port);
-            if (!clusterPeerPromise) {
-                clusterPeerPromise = (async () => {
-                    const eioPath = 'engine.io/connectRPCObject';
-                    const eioEndpoint = baseUrl ? new URL(eioPath, baseUrl).pathname : '/' + eioPath;
-                    const clusterPeerOptions = {
-                        path: eioEndpoint,
-                        query: {
-                            cacehBust,
-                            clusterObject: JSON.stringify(clusterObject),
-                        },
-                        withCredentials: true,
-                        extraHeaders,
-                        rejectUnauthorized: false,
-                        transports: options?.transports,
-                    };
+        const finalizationRegistry = new FinalizationRegistry((clusterPeer: RpcPeer) => {
+            clusterPeer.kill('object finalized');
+        });
+        const ensureClusterPeer = (clusterObject: ClusterObject, connectRPCObjectOptions?: ConnectRPCObjectOptions) => {
+            // If dedicatedTransport is true, don't reuse existing cluster peers
+            if (!connectRPCObjectOptions?.dedicatedTransport) {
+                let clusterPeerPromise = clusterPeers.get(clusterObject.port);
+                if (clusterPeerPromise)
+                    return clusterPeerPromise;
+            }
 
-                    const clusterPeerSocket = new eio.Socket(explicitBaseUrl, clusterPeerOptions);
-                    let peerReady = false;
-                    clusterPeerSocket.on('close', () => {
-                        clusterPeers.delete(clusterObject.port);
-                        if (!peerReady) {
-                            throw new Error("peer disconnected before setup completed");
+            const clusterPeerPromise = (async () => {
+                const eioPath = 'engine.io/connectRPCObject';
+                const eioEndpoint = new URL(eioPath, address).pathname;
+                const clusterPeerOptions = {
+                    path: eioEndpoint,
+                    query: {
+                        cacheBust,
+                        clusterObject: JSON.stringify(clusterObject),
+                        ...queryToken,
+                    },
+                    withCredentials: true,
+                    extraHeaders,
+                    rejectUnauthorized: false,
+                    transports: options?.transports,
+                };
+
+                const clusterPeerSocket = new eio.Socket(address, clusterPeerOptions);
+                let peerReady = false;
+
+                // Timeout handling for dedicated transports
+                let receiveTimeout: NodeJS.Timeout | undefined;
+                let sendTimeout: NodeJS.Timeout | undefined;
+                let clusterPeer: RpcPeer | undefined;
+
+                const clearTimers = () => {
+                    if (receiveTimeout) {
+                        clearTimeout(receiveTimeout);
+                        receiveTimeout = undefined;
+                    }
+                    if (sendTimeout) {
+                        clearTimeout(sendTimeout);
+                        sendTimeout = undefined;
+                    }
+                };
+
+                const resetReceiveTimeout = connectRPCObjectOptions?.dedicatedTransport?.receiveTimeout ? () => {
+                    if (receiveTimeout) {
+                        clearTimeout(receiveTimeout);
+                    }
+                    receiveTimeout = setTimeout(() => {
+                        if (clusterPeer) {
+                            clusterPeer.kill('receive timeout');
                         }
+                    }, connectRPCObjectOptions.dedicatedTransport.receiveTimeout);
+                } : undefined;
+
+                const resetSendTimeout = connectRPCObjectOptions?.dedicatedTransport?.sendTimeout ? () => {
+                    if (sendTimeout) {
+                        clearTimeout(sendTimeout);
+                    }
+                    sendTimeout = setTimeout(() => {
+                        if (clusterPeer) {
+                            clusterPeer.kill('send timeout');
+                        }
+                    }, connectRPCObjectOptions.dedicatedTransport.sendTimeout);
+                } : undefined;
+
+                clusterPeerSocket.on('close', () => {
+                    clusterPeer?.kill('socket closed');
+                    // Only remove from clusterPeers if it's not a dedicated transport
+                    if (!connectRPCObjectOptions?.dedicatedTransport) {
+                        clusterPeers.delete(clusterObject.port);
+                    }
+                    if (!peerReady) {
+                        throw new Error("peer disconnected before setup completed");
+                    }
+                });
+
+                try {
+                    await once(clusterPeerSocket, 'open');
+
+                    const serializer = createRpcDuplexSerializer({
+                        write: data => {
+                            resetSendTimeout?.();
+                            clusterPeerSocket.send(data);
+                        },
                     });
 
-                    try {
-                        await once(clusterPeerSocket, 'open');
+                    clusterPeerSocket.on('message', data => {
+                        resetReceiveTimeout?.();
+                        serializer.onData(Buffer.from(data));
+                    });
 
-                        const serializer = createRpcDuplexSerializer({
-                            write: data => clusterPeerSocket.send(data),
-                        });
-                        clusterPeerSocket.on('message', data => serializer.onData(Buffer.from(data)));
-
-                        const clusterPeer = new RpcPeer(clientName || 'engine.io-client', "cluster-proxy", (message, reject, serializationContext) => {
-                            try {
-                                serializer.sendMessage(message, reject, serializationContext);
-                            }
-                            catch (e) {
-                                reject?.(e as Error);
-                            }
-                        });
-                        serializer.setupRpcPeer(clusterPeer);
-                        clusterPeer.tags.localPort = sourcePeerId;
-                        peerReady = true;
-                        return clusterPeer;
-                    }
-                    catch (e) {
-                        console.error('failure ipc connect', e);
+                    clusterPeer = new RpcPeer(clientName || 'engine.io-client', "cluster-proxy", (message, reject, serializationContext) => {
+                        try {
+                            resetSendTimeout?.();
+                            serializer.sendMessage(message, reject, serializationContext);
+                        }
+                        catch (e) {
+                            reject?.(e as Error);
+                        }
+                    });
+                    clusterPeer.killedSafe.finally(() => {
+                        clearTimers();
                         clusterPeerSocket.close();
-                        throw e;
-                    }
-                })();
+                    });
+                    serializer.setupRpcPeer(clusterPeer);
+                    clusterPeer.tags.localPort = sourcePeerId;
+                    peerReady = true;
+
+                    // Initialize timeouts if configured
+                    resetReceiveTimeout?.();
+                    resetSendTimeout?.();
+
+                    return clusterPeer;
+                }
+                catch (e) {
+                    clearTimers();
+                    console.error('failure ipc connect', e);
+                    clusterPeerSocket.close();
+                    throw e;
+                }
+            })();
+
+            // Only store in clusterPeers if it's not a dedicated transport
+            if (!connectRPCObjectOptions?.dedicatedTransport) {
                 clusterPeers.set(clusterObject.port, clusterPeerPromise);
             }
+
             return clusterPeerPromise;
         };
 
@@ -636,7 +716,7 @@ export async function connectScryptedClient(options: ScryptedClientOptions): Pro
             return null;
         }
 
-        const connectRPCObject = async (value: any) => {
+        const connectRPCObject = async (value: any, options?: ConnectRPCObjectOptions) => {
             const clusterObject: ClusterObject = value?.__cluster;
             if (!clusterObject) {
                 return value;
@@ -651,13 +731,29 @@ export async function connectScryptedClient(options: ScryptedClientOptions): Pro
             }
 
             try {
-                const clusterPeerPromise = ensureClusterPeer(clusterObject);
+                const clusterPeerPromise = ensureClusterPeer(clusterObject, options);
                 const clusterPeer = await clusterPeerPromise;
                 const connectRPCObject: ConnectRPCObject = await clusterPeer.getParam('connectRPCObject');
-                const newValue = await connectRPCObject(clusterObject);
-                if (!newValue)
-                    throw new Error('ipc object not found?');
-                return newValue;
+                try {
+                    const newValue = await connectRPCObject(clusterObject);
+                    if (!newValue)
+                        throw new Error('ipc object not found?');
+
+                    // If dedicatedTransport is true, register the object for cleanup
+                    if (options?.dedicatedTransport) {
+                        finalizationRegistry.register(newValue, clusterPeer);
+                    }
+
+                    return newValue;
+                }
+                catch (e) {
+                    // If we have a clusterPeer and this is a dedicated transport, kill the connection
+                    // to prevent resource leaks when connectRPCObject fails
+                    if (options?.dedicatedTransport) {
+                        clusterPeer.kill('connectRPCObject failed');
+                    }
+                    throw e;
+                }
             }
             catch (e) {
                 console.error('failure ipc', e);

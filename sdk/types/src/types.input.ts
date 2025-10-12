@@ -1,10 +1,10 @@
 import type { ChildProcess as NodeChildProcess } from 'child_process';
 import type { Socket as NodeNetSocket } from 'net';
 import type { ChatCompletionStreamParams } from 'openai/lib/ChatCompletionStream';
-import type { ChatCompletionChunk, ChatCompletionCreateParamsNonStreaming, ChatCompletionMessageParam, ChatCompletion as ChatCompletionResponse, ChatCompletionTool } from 'openai/resources';
+import type { ChatCompletionChunk, ChatCompletionCreateParamsNonStreaming, ChatCompletionFunctionTool, ChatCompletionMessageParam, ChatCompletion as ChatCompletionResponse } from 'openai/resources';
 import type { Worker as NodeWorker } from 'worker_threads';
 import { CallToolResult } from './mcp';
-export type { ChatCompletionChunk, ChatCompletionCreateParamsNonStreaming, ChatCompletionCreateParamsStreaming, ChatCompletionMessageParam, ChatCompletion as ChatCompletionResponse, ChatCompletionTool } from 'openai/resources';
+export type { ChatCompletionChunk, ChatCompletionCreateParamsNonStreaming, ChatCompletionCreateParamsStreaming, ChatCompletionFunctionTool, ChatCompletionMessageParam, ChatCompletion as ChatCompletionResponse } from 'openai/resources';
 export type * from './mcp';
 
 export type ScryptedNativeId = string | undefined;
@@ -475,6 +475,10 @@ export interface Camera {
   getPictureOptions(): Promise<ResponsePictureOptions[]>;
 }
 
+export interface Resolution {
+  resolution?: number[];
+}
+
 export interface H264Info {
   sei?: boolean;
   stapb?: boolean;
@@ -931,6 +935,7 @@ export interface RecordedEventOptions {
   startTime?: number;
   endTime?: number;
   count?: number;
+  exclude?: string[];
 }
 
 export interface EventRecorder {
@@ -1070,7 +1075,7 @@ export interface PanTiltZoomCommand {
 
 
 export interface LLMTools {
-  getLLMTools(): Promise<ChatCompletionTool[]>;
+  getLLMTools(): Promise<ChatCompletionFunctionTool[]>;
   callLLMTool(name: string, parameters: Record<string, any>): Promise<CallToolResult>;
 }
 
@@ -2385,6 +2390,7 @@ export enum ScryptedInterface {
   Thermometer = "Thermometer",
   HumiditySensor = "HumiditySensor",
   Camera = "Camera",
+  Resolution = "Resolution",
   Microphone = "Microphone",
   AudioVolumeControl = "AudioVolumeControl",
   Display = "Display",
@@ -2836,6 +2842,13 @@ export interface ClusterManager {
   getClusterWorkers(): Promise<Record<string, ClusterWorker>>;
 }
 
+export interface ConnectRPCObjectOptions {
+    dedicatedTransport?: {
+      receiveTimeout?: number;
+      sendTimeout?: number;
+    };
+}
+
 export interface ScryptedStatic {
   /**
    * @deprecated
@@ -2870,5 +2883,5 @@ export interface ScryptedStatic {
    * through the Scrypted Server which typically manages plugin communication.
    * This is ideal for sending large amounts of data.
    */
-  connectRPCObject<T>(value: T): Promise<T>;
+  connectRPCObject<T>(value: T, options?: ConnectRPCObjectOptions): Promise<T>;
 }

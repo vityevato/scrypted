@@ -132,6 +132,12 @@ services:
         labels:
             - "com.centurylinklabs.watchtower.scope=scrypted"
 
+        # Use global DNS servers to avoid issues with some local DNS servers.
+        # particularly with npm registry, etc.
+        dns:
+            - ${SCRYPTED_DNS_SERVER_0:-1.1.1.1}
+            - ${SCRYPTED_DNS_SERVER_1:-8.8.8.8}
+
     # watchtower manages updates for Scrypted.
     watchtower:
         environment:
@@ -152,3 +158,9 @@ services:
             - 10444:8080
         # check for updates once an hour (interval is in seconds)
         command: --interval 3600 --cleanup --scope scrypted
+
+        # Use global DNS servers to avoid issues with some local DNS servers.
+        # particularly with npm registry, etc.
+        dns:
+            - ${SCRYPTED_DNS_SERVER_0:-1.1.1.1}
+            - ${SCRYPTED_DNS_SERVER_1:-8.8.8.8}

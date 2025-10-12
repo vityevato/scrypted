@@ -9,11 +9,17 @@ UBUNTU_24_04=$(lsb_release -r | grep "24.04")
 
 if [ -z "$UBUNTU_22_04" ] && [ -z "$UBUNTU_24_04" ]
 then
-    # proxmox is compatible with ubuntu 22.04, check for  /etc/pve directory
-    if [ -d "/etc/pve" ]
-    then
+    # proxmox is compatible with intel's ubuntu builds, check for /etc/pve directory
+    # then determine debian version
+    version=$(cat /etc/debian_version 2>/dev/null)
+
+    # Determine if it's Debian 12 or 13
+    if [[ "$version" == 12* ]]; then
         UBUNTU_22_04=true
+    elif [[ "$version" == 13* ]]; then
+        UBUNTU_24_04=true
     fi
+
 fi
 
 # needs either ubuntu 22.0.4 or 24.04
@@ -25,8 +31,10 @@ fi
 
 if [ -n "$UBUNTU_22_04" ]
 then
+    ubuntu_distro=ubuntu2204
     distro="22.04_amd64"
 else
+    ubuntu_distro=ubuntu2404
     distro="24.04_amd64"
 fi
 
@@ -38,22 +46,24 @@ set -e
 rm -rf /tmp/npu && mkdir -p /tmp/npu && cd /tmp/npu
 
 # level zero must also be installed
-LEVEL_ZERO_VERSION=1.22.4
+LEVEL_ZERO_VERSION=1.24.2
 # https://github.com/oneapi-src/level-zero
 curl -O -L https://github.com/oneapi-src/level-zero/releases/download/v"$LEVEL_ZERO_VERSION"/level-zero_"$LEVEL_ZERO_VERSION"+u$distro.deb
 curl -O -L https://github.com/oneapi-src/level-zero/releases/download/v"$LEVEL_ZERO_VERSION"/level-zero-devel_"$LEVEL_ZERO_VERSION"+u$distro.deb
 
 # npu driver
 # https://github.com/intel/linux-npu-driver
-NPU_VERSION=1.19.0
-NPU_VERSION_DATE=20250707-16111289554
-curl -O -L https://github.com/intel/linux-npu-driver/releases/download/v"$NPU_VERSION"/intel-driver-compiler-npu_$NPU_VERSION."$NPU_VERSION_DATE"_ubuntu$distro.deb
+NPU_VERSION=1.23.0
+NPU_VERSION_DATE=20250827-17270089246
+NPU_TAR_FILENAME=linux-npu-driver-v"$NPU_VERSION"."$NPU_VERSION_DATE"-$ubuntu_distro.tar.gz
+curl -O -L https://github.com/intel/linux-npu-driver/releases/download/v"$NPU_VERSION"/"$NPU_TAR_FILENAME"
+tar xzvf "$NPU_TAR_FILENAME"
+
 # firmware can only be installed on host. will cause problems inside container.
-if [ -n "$INTEL_FW_NPU" ]
+if [ ! -z "$INTEL_FW_NPU" ]
 then
-    curl -O -L https://github.com/intel/linux-npu-driver/releases/download/v"$NPU_VERSION"/intel-fw-npu_$NPU_VERSION."$NPU_VERSION_DATE"_ubuntu$distro.deb
+    rm *fw-npu*
 fi
-curl -O -L https://github.com/intel/linux-npu-driver/releases/download/v"$NPU_VERSION"/intel-level-zero-npu_$NPU_VERSION."$NPU_VERSION_DATE"_ubuntu$distro.deb
 
 apt -y update
 apt -y install libtbb12

@@ -1,21 +1,18 @@
-import { MediaStreamTrack, PeerConfig, RTCDataChannel, RTCPeerConnection, RTCRtpTransceiver, RtpPacket } from "./werift";
-
 import { Deferred } from "@scrypted/common/src/deferred";
-import sdk, { FFmpegInput, FFmpegTranscodeStream, Intercom, MediaObject, MediaStreamDestination, MediaStreamFeedback, RequestMediaStream, RTCAVSignalingSetup, RTCConnectionManagement, RTCGeneratorDataChannel, RTCInputMediaObjectTrack, RTCOutputMediaObjectTrack, RTCSignalingOptions, RTCSignalingSession, ScryptedInterface, ScryptedMimeTypes } from "@scrypted/sdk";
-import { ScryptedSessionControl } from "./session-control";
-import { optionalVideoCodec, opusAudioCodecOnly, requiredAudioCodecs, requiredVideoCodec } from "./webrtc-required-codecs";
-import { logIsLocalIceTransport } from "./werift-util";
-
 import { addVideoFilterArguments } from "@scrypted/common/src/ffmpeg-helpers";
 import { connectRTCSignalingClients, legacyGetSignalingSessionOptions } from "@scrypted/common/src/rtc-signaling";
 import { getSpsPps, getSpsPpsVps, MSection } from "@scrypted/common/src/sdp-utils";
+import sdk, { FFmpegInput, FFmpegTranscodeStream, Intercom, MediaObject, MediaStreamDestination, MediaStreamFeedback, RequestMediaStream, RTCAVSignalingSetup, RTCConnectionManagement, RTCInputMediaObjectTrack, RTCOutputMediaObjectTrack, RTCSignalingOptions, RTCSignalingSession, ScryptedInterface, ScryptedMimeTypes } from "@scrypted/sdk";
 import { H264Repacketizer } from "../../homekit/src/types/camera/h264-packetizer";
 import { OpusRepacketizer } from "../../homekit/src/types/camera/opus-repacketizer";
 import { H265Repacketizer } from "./h265-packetizer";
 import { logConnectionState, waitClosed, waitConnected, waitIceConnected } from "./peerconnection-util";
 import { RtpCodecCopy, RtpTrack, RtpTracks, startRtpForwarderProcess } from "./rtp-forwarders";
-import { getAudioCodec, getFFmpegRtpAudioOutputArguments } from "./webrtc-required-codecs";
+import { ScryptedSessionControl } from "./session-control";
+import { getAudioCodec, getFFmpegRtpAudioOutputArguments, optionalVideoCodec, opusAudioCodecOnly, requiredAudioCodecs, requiredVideoCodec } from "./webrtc-required-codecs";
+import { MediaStreamTrack, PeerConfig, RTCPeerConnection, RTCRtpTransceiver, RtpPacket } from "./werift";
 import { WeriftSignalingSession } from "./werift-signaling-session";
+import { logIsLocalIceTransport } from "./werift-util";
 
 function getDebugModeH264EncoderArgs() {
     return [
@@ -100,16 +97,17 @@ export async function createTrackForwarder(options: {
     if (!mo)
         return;
 
-    let mediaStreamFeedback: MediaStreamFeedback;
+    let hasMediaStreamFeedback = false;
     try {
-        mediaStreamFeedback = await sdk.mediaManager.convertMediaObject(mo, ScryptedMimeTypes.MediaStreamFeedback);
+        const mediaStreamFeedback = await sdk.connectRPCObject(await sdk.mediaManager.convertMediaObject<MediaStreamFeedback>(mo, ScryptedMimeTypes.MediaStreamFeedback));
+        if (mediaStreamFeedback) {
+            videoTransceiver.sender.onRtcp.subscribe(rtcp => {
+                mediaStreamFeedback.onRtcp(rtcp.serialize());
+            });
+            hasMediaStreamFeedback = true;
+        }
     }
     catch (e) {
-    }
-    if (mediaStreamFeedback) {
-        videoTransceiver.sender.onRtcp.subscribe(rtcp => {
-            mediaStreamFeedback.onRtcp(rtcp.serialize());
-        });
     }
 
     const console = sdk.deviceManager.getMixinConsole(mo.sourceId);
@@ -256,7 +254,7 @@ export async function createTrackForwarder(options: {
         }
     }
 
-    if (mediaStreamFeedback)
+    if (hasMediaStreamFeedback)
         needPacketization = false;
 
     let opusRepacketizer: OpusRepacketizer;
@@ -583,10 +581,20 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
         let requestMediaStream: RequestMediaStream;
 
         try {
-            requestMediaStream = await sdk.mediaManager.convertMediaObject(mediaObject, ScryptedMimeTypes.RequestMediaStream);
+            requestMediaStream = await sdk.connectRPCObject(await sdk.mediaManager.convertMediaObject(mediaObject, ScryptedMimeTypes.RequestMediaStream));
         }
         catch (e) {
+            mediaObject = await sdk.connectRPCObject(mediaObject);
             requestMediaStream = async () => mediaObject;
+        }
+
+        const wrapped: RequestMediaStream = async options => {
+            if (!requestMediaStream)
+                throw new Error("RequestMediaStream can't be called twice");
+            const rms = requestMediaStream;
+            requestMediaStream = undefined;
+            const mo = rms(options);
+            return sdk.connectRPCObject(mo);
         }
 
         let intercom = sdk.systemManager.getDeviceById<Intercom>(mediaObject.sourceId);
@@ -610,7 +618,7 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
                 const ret = await createTrackForwarder({
                     timeStart,
                     ...logIsLocalIceTransport(console, this.pc),
-                    requestMediaStream,
+                    requestMediaStream: wrapped,
                     videoTransceiver,
                     audioTransceiver,
                     maximumCompatibilityMode: this.maximumCompatibilityMode,
