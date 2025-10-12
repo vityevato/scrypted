@@ -1,5 +1,5 @@
 import { HikvisionCamera } from "../../hikvision/src/main"
-import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, Reboot, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, LockState, Readme } from "@scrypted/sdk";
+import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, Reboot, RequestPictureOptions, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, LockState, Readme } from "@scrypted/sdk";
 import { PassThrough } from "stream";
 import { RtpPacket } from '../../../external/werift/packages/rtp/src/rtp/rtp';
 import { createRtspMediaStreamOptions, RtspProvider, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
@@ -15,7 +15,7 @@ import { HikvisionTamperAlert } from "./tamper-alert"
 import * as fs from 'fs/promises';
 import { join } from 'path';
 import { makeDebugConsole, DebugController } from "./debug-console";
-import { RtpMultiplexer } from "./rtp-multiplexer";
+import { RtpStreamSwitcher } from "./rtp-stream-switcher";
 import { HttpStreamSwitcher, HttpSession } from "./http-stream-switcher";
 
 const { mediaManager } = sdk;
@@ -76,9 +76,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     private gracePeriodTimer?: NodeJS.Timeout;
     private waitingForReconnect: boolean = false;
     
-    // RTP multiplexer for seamless target switching (SIP mode)
-    private rtpMultiplexer?: RtpMultiplexer;
-    private currentTargetId: string = 'primary';
+    // RTP stream switcher for seamless target switching (SIP mode)
+    private rtpStreamSwitcher?: RtpStreamSwitcher;
     
     // HTTP stream switcher for seamless reconnection (ISAPI mode)
     private httpStreamSwitcher?: HttpStreamSwitcher;
@@ -100,8 +99,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     destroy(): void
     {
         this.clearGracePeriod();
-        this.rtpMultiplexer?.destroy();
-        this.rtpMultiplexer = undefined;
+        this.rtpStreamSwitcher?.destroy();
+        this.rtpStreamSwitcher = undefined;
         this.httpStreamSwitcher?.destroy();
         this.httpStreamSwitcher = undefined;
         this.sipManager?.stop();
@@ -192,7 +191,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 this.console.info (`Doorbell ${event.toString()} detected`);
                 if (this.intercomBusy && invite) 
                 {
-                    this.cancelCall().then(() => {
+                    this.stopCall().then(() => {
                         // Check if we're in ISAPI mode (no SIP) and can do seamless reconnection
                         if (!this.sipManager && this.httpStreamSwitcher) 
                         {
@@ -234,8 +233,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                     
                     clearTimeout (this.doorOpenDurationTimeout);
                     
-                    if (isUnlock) {
-                        setTimeout(() => this.stopRing(), LOCK_AUDIO_NOTIFY_SEC * 1000);
+                    if (isUnlock && this.binaryState) {
+                        setTimeout (() => this.stopCall(), LOCK_AUDIO_NOTIFY_SEC * 1000);
                     }
                 } else {
                     this.console.warn (`Lock for door ${doorNo} not found`);
@@ -253,7 +252,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 
                 if (entrySensor) {
                     const isOpen = event !== HikvisionDoorbellEvent.DoorClosed;
-                    if (isOpen) { this.stopRing(); }
+                    if (isOpen && this.binaryState) { this.stopCall(); }
                     entrySensor.binaryState = isOpen;
                     this.console.info (`Door ${doorNo} entry sensor: ${isOpen ? 'opened' : 'closed'}`);
                 } else {
@@ -265,12 +264,13 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         return events;
     }
 
-    private async cancelCall(): Promise<void>
+    private async stopCall(): Promise<void>
     {
         try
         {
             if (this.sipManager) {
                 await this.sipManager.answer();
+                await this.sipManager.hangup();
             }
             else {
                 await this.getClient().cancelCall();
@@ -282,20 +282,20 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         }
     }
 
-    private createSipAudioTrack (codec: string, useMultiplexer: boolean = false)
+    private createSipAudioTrack (codec: string, useSwitcher: boolean = false)
     {
         let flag = true;
         
-        if (useMultiplexer) {
-            // Use multiplexer for target switching support
+        if (useSwitcher) {
+            // Use switcher for seamless target switching support
             return {
                 onRtp: (rtp: Buffer) => {
                     if (flag) {
-                        this.console.debug ('First RTP packet, sending to multiplexer');
+                        this.console.debug ('First RTP packet, sending to switcher');
                         flag = false;
                     }
-                    // Send to multiplexer which will distribute to all targets
-                    this.rtpMultiplexer?.sendRtp (rtp);
+                    // Send to switcher which will forward to current active target
+                    this.rtpStreamSwitcher?.sendRtp (rtp);
                 },
                 codecCopy: codec,
                 encoderArguments: [
@@ -305,7 +305,7 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 ]
             };
         } else {
-            // Direct RTP mode (fallback if multiplexer not used)
+            // Direct RTP mode (fallback if switcher not used)
             const target = this.sipManager?.remoteAudioTarget;
             if (!target) {
                 throw new Error ('No remote audio target available');
@@ -392,8 +392,8 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
 
     private async switchAudioTarget (): Promise<boolean>
     {
-        if (!this.rtpMultiplexer) {
-            this.console.warn ('Cannot switch audio target: multiplexer not initialized');
+        if (!this.rtpStreamSwitcher) {
+            this.console.warn ('Cannot switch audio target: switcher not initialized');
             return false;
         }
 
@@ -406,10 +406,9 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         try {
             this.console.info (`Switching audio target to ${newTarget.ip}:${newTarget.port}`);
             
-            // Remove old target and add new target in multiplexer
+            // Switch to new target
             // This allows seamless switching without killing the forwarder
-            this.rtpMultiplexer.removeTarget (this.currentTargetId);
-            this.rtpMultiplexer.addTarget (this.currentTargetId, newTarget.ip, newTarget.port);
+            this.rtpStreamSwitcher.switchTarget (newTarget.ip, newTarget.port);
             
             this.console.info ('Audio target switched successfully');
             return true;
@@ -795,6 +794,9 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
         this.eventApi = undefined;
         (this.client as HikvisionDoorbellAPI)?.destroy();
         this.client = undefined;
+        
+        // Clear cached video channels to force refresh from device
+        this.storage.removeItem ('channelsJSON');
 
         // remove 0 port for autoselect port number
         if (key === SIP_SERVER_PORT_KEY && value === '0') { 
@@ -902,6 +904,31 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
     }
 
 
+    override async takeSmartCameraPicture (options?: RequestPictureOptions): Promise<MediaObject>
+    {
+        const api: HikvisionDoorbellAPI = this.getClient();
+        
+        // Get target resolution from options or use stream metadata
+        let targetWidth = options?.picture?.width;
+        let targetHeight = options?.picture?.height;
+        
+        // If no specific resolution requested, use main stream resolution to ensure correct aspect ratio
+        if (!targetWidth || !targetHeight) {
+            try {
+                const streams = await this.getConstructedVideoStreamOptions();
+                if (streams?.[0]?.video) {
+                    targetWidth = streams[0].video.width;
+                    targetHeight = streams[0].video.height;
+                    this.console.debug (`Using stream resolution for snapshot: ${targetWidth}x${targetHeight}`);
+                }
+            } catch (error) {
+                this.console.warn (`Failed to get stream resolution for snapshot: ${error}`);
+            }
+        }
+        
+        return mediaManager.createMediaObject (await api.jpegSnapshot (this.getRtspChannel(), options?.timeout, targetWidth, targetHeight), 'image/jpeg');
+    }
+
     override async startIntercom(media: MediaObject): Promise<void> 
     {
         // Simple debounce protection
@@ -982,15 +1009,15 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
             // Configure audio track based on mode (SIP or HTTP)
             let audioTrack;
             if (sipAudioTarget) {
-                // Initialize multiplexer if not exists
-                if (!this.rtpMultiplexer) {
-                    this.rtpMultiplexer = new RtpMultiplexer (this.console);
+                // Initialize switcher if not exists
+                if (!this.rtpStreamSwitcher) {
+                    this.rtpStreamSwitcher = new RtpStreamSwitcher (this.console);
                 }
                 
-                // Add initial target to multiplexer
-                this.rtpMultiplexer.addTarget (this.currentTargetId, sipAudioTarget.ip, sipAudioTarget.port);
+                // Set initial target
+                this.rtpStreamSwitcher.switchTarget (sipAudioTarget.ip, sipAudioTarget.port);
                 
-                // Create audio track with multiplexer enabled
+                // Create audio track with switcher enabled
                 audioTrack = this.createSipAudioTrack (codec, true);
             } else {
                 // HTTP mode needs buffer accumulation, write to switcher
@@ -1095,10 +1122,10 @@ export class HikvisionCameraDoorbell extends HikvisionCamera implements Camera, 
                 }
                 this.activeIntercom = undefined;
 
-                // Cleanup multiplexers
-                if (this.rtpMultiplexer) {
-                    this.rtpMultiplexer.destroy();
-                    this.rtpMultiplexer = undefined;
+                // Cleanup stream switchers
+                if (this.rtpStreamSwitcher) {
+                    this.rtpStreamSwitcher.destroy();
+                    this.rtpStreamSwitcher = undefined;
                 }
 
                 if (this.sipManager) {
@@ -1470,6 +1497,39 @@ export class HikvisionDoorbellProvider extends RtspProvider
 
     override createCamera(nativeId: string) {
         return new HikvisionCameraDoorbell(nativeId, this);
+    }
+
+    async getCreateDeviceSettings(): Promise<Setting[]> {
+        return [
+            {
+                key: 'username',
+                title: 'Username',
+            },
+            {
+                key: 'password',
+                title: 'Password',
+                type: 'password',
+            },
+            {
+                key: 'ip',
+                title: 'IP Address',
+                placeholder: '192.168.2.222',
+            },
+            {
+                subgroup: 'Advanced',
+                key: 'httpPort',
+                title: 'HTTP Port',
+                description: 'Optional: Override the HTTP Port from the default value of 80.',
+                placeholder: '80',
+            },
+            {
+                subgroup: 'Advanced',
+                key: 'skipValidate',
+                title: 'Skip Validation',
+                description: 'Add the device without verifying the credentials and network settings.',
+                type: 'boolean',
+            }
+        ]
     }
 
     override async createDevice(settings: DeviceCreatorSettings, nativeId?: string): Promise<string> {

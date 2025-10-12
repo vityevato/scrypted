@@ -100,27 +100,11 @@ export class HttpStreamSwitcher extends EventEmitter
     }
 
     /**
-     * Check if session is active
-     */
-    hasActiveSession(): boolean
-    {
-        return this.currentSession !== undefined;
-    }
-
-    /**
      * Get current session ID
      */
     getCurrentSessionId(): string | undefined
     {
         return this.currentSession?.sessionId;
-    }
-
-    /**
-     * Check if given sessionId is current
-     */
-    isCurrentSession (sessionId: string): boolean
-    {
-        return this.currentSession?.sessionId === sessionId;
     }
 
     /**
@@ -137,17 +121,6 @@ export class HttpStreamSwitcher extends EventEmitter
     getCurrentSession(): HttpSession | undefined
     {
         return this.currentSession;
-    }
-
-    /**
-     * Get statistics
-     */
-    getStats(): { byteCount: number; streamSwitchCount: number }
-    {
-        return {
-            byteCount: this.byteCount,
-            streamSwitchCount: this.streamSwitchCount
-        };
     }
 
     /**

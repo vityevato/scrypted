@@ -191,6 +191,26 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         return true;
     }
 
+    override async jpegSnapshot (channel: string, timeout = 10000, width?: number, height?: number): Promise<Buffer>
+    {
+        let url = `http://${this.endpoint}/ISAPI/Streaming/channels/${getChannel (channel)}/picture?snapShotImageType=JPEG`
+        
+        // Add optional resolution parameters
+        if (width) {
+            url += `&videoResolutionWidth=${width}`;
+        }
+        if (height) {
+            url += `&videoResolutionHeight=${height}`;
+        }
+
+        const response = await this.request ({
+            url: url,
+            timeout,
+        });
+
+        return response.body;
+    }
+
     emitEvent (eventName: string | symbol, ...args: any[])
     {
         try {
@@ -260,6 +280,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
         let channels: MediaStreamOptions[];
         try {
             channels = await this.getCodecs (camNumber);
+            this.console.info (`Video channels from device: ${JSON.stringify (channels)}`);
             this.storage.setItem ('channelsJSON', JSON.stringify (channels));
         }
         catch (e) {
@@ -267,6 +288,7 @@ export class HikvisionDoorbellAPI extends HikvisionCameraAPI
             if (!raw)
                 throw e;
             channels = JSON.parse (raw);
+            this.console.warn (`Using cached video channels: ${raw}`);
         }
         const ret = new Map<string, MediaStreamOptions>();
         for (const streamingChannel of channels) {
